@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pandas
+sdv
+pydantic
+google-cloud-storage
+google-cloud-aiplatform
