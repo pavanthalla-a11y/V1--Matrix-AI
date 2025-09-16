@@ -75,6 +75,64 @@ The service will:
 3. Store the results in Google Cloud Storage
 4. Return the status of the operation
 
+## API Specification
+
+### Endpoints
+
+#### POST /generate-and-store
+
+Generate synthetic data based on a natural language description and store it in Google Cloud Storage.
+
+**Request**
+- Method: POST
+- Content-Type: application/json
+- Body:
+```json
+{
+    "data_description": "string",  // Natural language description of the desired data
+    "num_records": "integer"       // Number of synthetic records to generate
+}
+```
+
+**Response**
+- Success (200 OK):
+```json
+{
+    "message": "Data generation and storage successful!",
+    "status": "completed"
+}
+```
+
+- Error (500 Internal Server Error):
+```json
+{
+    "detail": "Error message describing what went wrong"
+}
+```
+
+**Example**
+```bash
+curl -X POST "http://localhost:8000/generate-and-store" \
+     -H "Content-Type: application/json" \
+     -d '{
+         "data_description": "Create a customer database with orders and products. Include customer details like name, email, and address. Orders should have order date, total amount, and status. Products should have name, price, and category.",
+         "num_records": 1000
+     }'
+```
+
+### API Documentation
+
+The complete API documentation is available at:
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+
+These interactive documentation pages provide detailed information about:
+- All available endpoints
+- Request/response schemas
+- Example requests
+- Authentication requirements
+- Error responses
+
 ## Docker Support
 
 Build and run using Docker:
