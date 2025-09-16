@@ -1,4 +1,4 @@
-# Matrix AI Generator
+# Matrix AI
 
 A sophisticated synthetic data generation service that combines AI-powered schema generation with the Synthetic Data Vault (SDV) framework.
 
@@ -79,8 +79,8 @@ The service will:
 
 Build and run using Docker:
 ```bash
-docker build -t matrix-ai-generator .
-docker run -p 8000:8000 matrix-ai-generator
+docker build -t matrix-ai .
+docker run -p 8000:8000 matrix-ai
 ```
 
 ## License
