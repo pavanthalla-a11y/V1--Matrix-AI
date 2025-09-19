@@ -1,8 +1,31 @@
 import pandas as pd
+import json
+import traceback
+import google.auth
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any
+from sdv.multi_table import HMASynthesizer
+from sdv.metadata import MultiTableMetadata, SingleTableMetadata
+from sdv.single_table import CTGANSynthesizer
+
+# SDV for single and multi-table synthesis
+#from sdv.multi_table import HMASynthesizer
+#from sdv.metadata import Metadata, SingleTableMetadata
+
+# Google Cloud integrations
+from google.cloud import storage
+import vertexai
+from vertexai.generative_models import GenerativeModel
+
+import pandas as pd
 from sdv.multi_table import HMASynthesizer
 from sdv.metadata import MultiTableMetadata
 import io
 import json
+import traceback
+import sys
+import google.auth
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any, List
@@ -10,113 +33,270 @@ from google.cloud import storage
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-# Import the configuration variables
-from config import GCP_PROJECT_ID, GCS_BUCKET_NAME
+# Import configuration variables from your config file
+from config import GCP_PROJECT_ID, GCS_BUCKET_NAME, GCP_LOCATION, GEMINI_MODEL
 
+# --- FastAPI App Initialization ---
 app = FastAPI(
-    title="SDG All-in-One Orchestrator",
-    description="A single service to generate data and store it in GCS.",
-    version="2.0.0"
+    title="Matrix AI - Synthetic Data Generator",
+    description="Generate, preview, and store synthetic data using AI + SDV.",
+    version="4.0.0"
 )
 
-# --- Pydantic Models for API ---
-class DataRequest(BaseModel):
+# --- In-memory Cache ---
+generated_data_cache: Dict[str, Any] = {"data": None, "metadata": None}
+
+
+# --- Pydantic Models for API Requests ---
+class GenerateRequest(BaseModel):
     data_description: str
     num_records: int
-    
+
+class StoreRequest(BaseModel):
+    confirm_storage: bool
+
+
 # --- Core Logic Functions ---
 
 def call_ai_agent(data_description: str) -> Dict[str, Any]:
     """
     Calls the Gemini API to get the metadata schema and seed data.
-    Returns a dictionary with 'metadata_dict' and 'seed_tables_dict'.
     """
-    vertexai.init(project=GCP_PROJECT_ID, location="us-central1")
-    model = GenerativeModel("gemini-1.0-pro")
-
-    prompt_text = f"""
-    You are a professional data architect. Generate a single JSON object that contains:
-    1. A 'metadata_dict' for a synthetic multi-table dataset that matches the description.
-    2. A 'seed_tables_dict' with mock seed data for each table.
-    
-    The description of the data is: "{data_description}"
-    
-    The metadata format must follow the SDV MultiTableMetadata specifications with 'sdtype's.
-    Ensure all tables have a 'primary_key' and that 'relationships' are correctly defined.
-    The seed data for each table should be a list of dictionaries.
-    
-    Return only the complete JSON object, nothing else.
-    """
-    
+    print("Initializing Vertex AI...")
     try:
-        response = model.generate_content(prompt_text, generation_config={"response_mime_type": "application/json"})
-        response_json = response.text
-        return json.loads(response_json)
+        credentials, project = google.auth.default()
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
+        
+        model = GenerativeModel(
+            GEMINI_MODEL,
+            generation_config={"response_mime_type": "application/json"}
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Agent failed to generate schema: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to initialize Vertex AI: {e}")
+
+    prompt = f"""
+    You are a professional data architect. Based on the following description, generate a single JSON object with two top-level keys: 'metadata_dict' and 'seed_tables_dict'.
+
+    Description: "{data_description}"
+
+    CRITICAL INSTRUCTIONS:
+    1.  **Metadata:** The `metadata_dict` must follow the older SDV format.
+    2.  **Relationships:** Define relationships in a top-level 'relationships' list. Each relationship MUST use these four keys:
+    - **`parent_table_name`**: The name of the parent table.
+    - **`child_table_name`**: The name of the child table.
+    - **`parent_primary_key`**: The primary key of the parent.
+    - **`child_foreign_key`**: The foreign key of the child.
+    3.  **CRITICAL NAMING:** All table names used in the `metadata_dict` and as keys in the `seed_tables_dict` **MUST be identical and in all uppercase** (e.g., 'CUSTOMERS', 'PRODUCTS').
+    4.  **Seed Data:** Provide 15 realistic seed records for each table, ensuring referential integrity.
+    5.  **Output:** Return ONLY the complete JSON object.
+"""
+
+    print("Generating schema with Gemini...")
+    try:
+        response = model.generate_content(prompt)
+        print(response)
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        print(f"ERROR: Gemini returned malformed JSON.\nResponse Text: {response.text}")
+        raise HTTPException(status_code=500, detail="AI agent returned invalid JSON. Please try a different prompt.")
+    except Exception as e:
+        print(f"ERROR: An unexpected error occurred during AI call: {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred while communicating with the AI agent: {e}")
+
 
 def generate_sdv_data(num_records: int, metadata_dict: Dict[str, Any], seed_tables_dict: Dict[str, Any]) -> Dict[str, pd.DataFrame]:
     """
-    Uses the SDV library to generate synthetic data.
+    Uses SDV to generate synthetic data using the stable legacy API.
     """
+
+    print(metadata_dict['tables'])
+
     try:
-        metadata = MultiTableMetadata.load_from_dict(metadata_dict)
-        seed_tables = {
-            table_name: pd.DataFrame.from_dict(table_data)
-            for table_name, table_data in seed_tables_dict.items()
-        }
-        synthesizer = HMASynthesizer(metadata)
-        synthesizer.fit(seed_tables)
-        synthetic_tables = synthesizer.sample(num_records)
-        return synthetic_tables
+        # --- Single-Table Logic ---
+        if len(metadata_dict['tables']) == 1:
+            table_name = list(metadata_dict['tables'].keys())[0]
+            print(f"Using single-table synthesizer for '{table_name}'...")
+            
+            seed_table_df = pd.DataFrame.from_records(seed_tables_dict[table_name])
+            metadata = SingleTableMetadata()
+            metadata.detect_from_dataframe(seed_table_df)
+            
+            synthesizer = CTGANSynthesizer(metadata)
+            synthesizer.fit(seed_table_df)
+            synthetic_table = synthesizer.sample(num_rows=num_records)
+            return {table_name: synthetic_table}
+
+        # --- Multi-Table Logic using legacy classes ---
+        else:
+            print("Multi-table detected. Using HMASynthesizer with MultiTableMetadata.")
+            
+            # --- START: ADD THIS SCHEMA CLEANUP BLOCK ---
+            # Remove unsupported keys like 'subtype' from the metadata dictionary
+            for table_meta in metadata_dict.get('tables', {}).values():
+                for column_meta in table_meta.get('columns', {}).values():
+                    if 'subtype' in column_meta:
+                        del column_meta['subtype']
+                        print(f"Cleaned unsupported 'subtype' key.")
+            # --- END: ADD THIS SCHEMA CLEANUP BLOCK ---
+
+            # Use the old metadata class, which is compatible with HMASynthesizer
+            metadata = MultiTableMetadata.load_from_dict(metadata_dict)
+            
+
+            print(metadata)
+                  
+
+            # Create the seed tables dictionary
+            seed_tables = {}
+
+            metadata_name_map = {name.lower(): name for name in metadata.tables}
+            
+
+            for seed_name, seed_data in seed_tables_dict.items():
+                lower_seed_name = seed_name.lower()
+                if lower_seed_name in metadata_name_map:
+                    # Use the official name from the metadata as the key
+                    correct_name = metadata_name_map[lower_seed_name]
+                    seed_tables[correct_name] = pd.DataFrame.from_records(seed_data)
+                    print(f"Matched seed table '{seed_name}' to metadata table '{correct_name}'.")
+
+            
+            # Enforce referential integrity (important for legacy classes too)
+            for relation in metadata.relationships:
+                parent_name = relation['parent_table_name']
+                child_name = relation['child_table_name']
+                parent_pk = relation['parent_primary_key']
+                child_fk = relation['child_foreign_key']
+
+                if parent_name in seed_tables and child_name in seed_tables:
+                    parent_df = seed_tables[parent_name]
+                    child_df = seed_tables[child_name]
+                    parent_key_type = parent_df[parent_pk].dtype
+                    child_df[child_fk] = child_df[child_fk].astype(parent_key_type)
+                    valid_parent_keys = set(parent_df[parent_pk])
+                    child_df = child_df[child_df[child_fk].isin(valid_parent_keys)]
+                    seed_tables[child_name] = child_df
+
+            # Initialize the synthesizer
+            synthesizer = HMASynthesizer(metadata)
+            
+            print("Fitting synthesizer...")
+            synthesizer.fit(seed_tables)
+            
+            print(f"Sampling {num_records} records...")
+            return synthesizer.sample(num_records)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SDV generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"SDV generation failed: {traceback.format_exc()}")
+
+
 
 def upload_to_gcs(bucket_name: str, synthetic_data: Dict[str, pd.DataFrame]):
     """
-    Uploads each DataFrame to a Google Cloud Storage bucket as a CSV file.
+    Uploads each DataFrame in the synthetic_data dictionary to a GCS bucket.
     """
     try:
         storage_client = storage.Client(project=GCP_PROJECT_ID)
         bucket = storage_client.bucket(bucket_name)
 
         for table_name, df in synthetic_data.items():
-            file_name = f"{table_name}_synthetic.csv"
+            timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+            file_name = f"{table_name}_synthetic_{timestamp}.csv"
             
-            csv_in_memory = io.StringIO()
-            df.to_csv(csv_in_memory, index=False)
-            csv_in_memory.seek(0)
-            
+            print(f"Uploading {file_name} to GCS bucket '{bucket_name}'...")
             blob = bucket.blob(file_name)
-            blob.upload_from_file(csv_in_memory, content_type='text/csv')
-            print(f"Uploaded {file_name} to GCS.")
-
+            blob.upload_from_string(df.to_csv(index=False), 'text/csv')
+            
+        print("All files uploaded successfully.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"GCS upload failed: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"GCS upload failed: {traceback.format_exc()}"
+        )
+
 
 # --- API Endpoints ---
 
-@app.post("/generate-and-store")
-async def generate_and_store(request: DataRequest):
+@app.post("/api/v1/generate")
+async def generate_data_endpoint(request: GenerateRequest):
     """
-    Orchestrates the entire data generation and storage process.
+    Generates synthetic data based on a description and caches it.
     """
-    print("Step 1: Calling AI Agent to generate schema and seed data...")
-    ai_output = call_ai_agent(request.data_description)
-    metadata_dict = ai_output.get("metadata_dict")
-    seed_tables_dict = ai_output.get("seed_tables_dict")
+    global generated_data_cache
     
-    if not metadata_dict or not seed_tables_dict:
-        raise HTTPException(status_code=500, detail="AI Agent returned incomplete data.")
-
-    print("Step 2: Generating synthetic data with SDV...")
+    ai_output = call_ai_agent(request.data_description)
     synthetic_data = generate_sdv_data(
         request.num_records,
-        metadata_dict,
-        seed_tables_dict
+        ai_output["metadata_dict"],
+        ai_output["seed_tables_dict"]
     )
+    
+    total_records = sum(len(df) for df in synthetic_data.values())
+    
+    generated_data_cache["data"] = synthetic_data
+    generated_data_cache["metadata"] = {
+        "description": request.data_description,
+        "total_records_generated": total_records,
+        "tables": {
+            name: {"rows": len(df), "columns": df.columns.tolist()}
+            for name, df in synthetic_data.items()
+        }
+    }
+    
+    return {
+        "status": "success",
+        "message": f"Generated {total_records} records across {len(synthetic_data)} tables.",
+        "metadata": generated_data_cache["metadata"],
+        "next_step": "Use GET /api/v1/sample?table_name=<table_name> to preview data."
+    }
 
-    print("Step 3: Uploading generated files to GCS...")
-    upload_to_gcs(GCS_BUCKET_NAME, synthetic_data)
 
-    return {"message": "Data generation and storage successful!", "status": "completed"}
+@app.get("/api/v1/sample")
+async def sample_data_endpoint(table_name: str, sample_size: int = 100):
+    """
+    Returns a sample of the generated data for a specific table.
+    """
+    global generated_data_cache
+    if not generated_data_cache.get("data"):
+        raise HTTPException(status_code=404, detail="No data generated. Use POST /api/v1/generate first.")
+    
+    if table_name not in generated_data_cache["data"]:
+        available = list(generated_data_cache["data"].keys())
+        raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found. Available tables: {available}")
+
+    table_df = generated_data_cache["data"][table_name]
+    sample_df = table_df.head(min(sample_size, len(table_df)))
+    
+    return {
+        "table_name": table_name,
+        "total_records_in_table": len(table_df),
+        "sample_size": len(sample_df),
+        "sample_data": sample_df.to_dict('records')
+    }
+
+
+@app.post("/api/v1/store")
+async def store_data_endpoint(request: StoreRequest):
+    """
+    Stores all tables from the cache into Google Cloud Storage.
+    """
+    global generated_data_cache
+    if not generated_data_cache.get("data"):
+        raise HTTPException(status_code=404, detail="No data to store. Use POST /api/v1/generate first.")
+    
+    if not request.confirm_storage:
+        raise HTTPException(status_code=400, detail="Storage not confirmed. Set `confirm_storage` to `true`.")
+
+    upload_to_gcs(GCS_BUCKET_NAME, generated_data_cache["data"])
+    
+    stored_tables_metadata = generated_data_cache["metadata"]["tables"]
+    
+    # Clear the cache after successful storage
+    generated_data_cache = {"data": None, "metadata": None}
+    
+    return {
+        "status": "success",
+        "message": f"Successfully stored {len(stored_tables_metadata)} tables to GCS.",
+        "bucket": GCS_BUCKET_NAME,
+        "stored_tables": stored_tables_metadata
+    }
