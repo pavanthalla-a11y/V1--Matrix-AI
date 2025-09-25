@@ -5,3 +5,6 @@ sdv
 pydantic
 google-cloud-storage
 google-cloud-aiplatform
+
+streamlit
+requests
