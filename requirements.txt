@@ -5,6 +5,9 @@ sdv
 pydantic
 google-cloud-storage
 google-cloud-aiplatform
-
+google-auth
+vertexai
 streamlit
 requests
+email-validator
+plotly
