@@ -29,7 +29,6 @@ from collections import Counter
 from sdv.metadata import Metadata
 from sdv.single_table import GaussianCopulaSynthesizer, CTGANSynthesizer
 from sdv.multi_table import HMASynthesizer
-from sdv.utils import drop_unknown_references
 
 # --- GOOGLE CLOUD IMPORTS ---
 from google.cloud import storage
@@ -208,16 +207,8 @@ def validate_and_fix_json_response(response_text: str) -> Dict[str, Any]:
         fixed_text = re.sub(r'"%([YmdHMS])"', r'%\1', fixed_text)
         fixed_text = re.sub(r'"([^"]*%[YmdHMS][^"]*)"([^,}\]])', r'"\1"\2', fixed_text)
         
-        # Fix specific corruption patterns seen in logs
-        fixed_text = re.sub(r'"sdtype":dol":', r'"sdtype":', fixed_text)  # Fix "sdtype":dol": -> "sdtype":
-        fixed_text = re.sub(r'"([^"]*)":\s*([^",:}\]]+)":', r'"\1": "\2",', fixed_text)  # Fix malformed key-value pairs
-        fixed_text = re.sub(r':([a-zA-Z][a-zA-Z0-9_]*)":', r': "\1",', fixed_text)  # Fix unquoted values followed by quote-colon
-        
-        # Fix missing quotes around values that should be strings
-        fixed_text = re.sub(r':\s*([a-zA-Z][a-zA-Z0-9_]*)\s*([,}])', r': "\1"\2', fixed_text)
-        
         # Try multiple parsing attempts with different fixes
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 return json.loads(fixed_text)
             except json.JSONDecodeError as e2:
@@ -282,55 +273,32 @@ def call_ai_agent(data_description: str, existing_metadata_json: str = None) -> 
         raise HTTPException(status_code=500, detail=f"Failed to initialize Vertex AI: {e}")
 
     prompt = f"""
-    You are a professional data architect creating realistic datasets for AI/ML model training. Generate a single JSON object with two top-level keys: 'metadata_dict' and 'seed_tables_dict'.
+    You are a professional data architect. Generate a single JSON object with two top-level keys: 'metadata_dict' and 'seed_tables_dict'.
 
     **Core Request:** "{data_description}"
     
     {'**Refinement/Modification Instruction:** Based on the user\'s new description, modify the schema and seed data. Here is the existing metadata: ' + existing_metadata_json if existing_metadata_json else ''}
 
-    **CRITICAL DATA REALISM FOR AI/ML TRAINING:**
-    1. **REALISTIC DATA ONLY:** Generate data that looks like real-world data for AI/ML training:
-        - Names: Use real human names (John Smith, Sarah Johnson, etc.) - NO codes like 'AAA3', 'User123'
-        - Phone Numbers: Use proper formats (555-123-4567, +1-555-123-4567) - NO letters like '563Z778712L'
-        - Email Addresses: Realistic emails (john.smith@email.com, sarah.j@company.com)
-        - Addresses: Real street names, cities, states (123 Main St, New York, NY 10001)
-        - Company Names: Realistic business names (TechCorp Inc., Global Solutions LLC)
-        - Product Names: Meaningful product names (not Product1, Product2)
-        - Descriptions: Natural language descriptions, not codes or placeholders
-        - Categories: Use real-world categories and classifications
-        - Prices/Amounts: Realistic price ranges for the domain
-        - Dates: Meaningful date ranges that make business sense
-
-    2. **DATA DISTRIBUTION FOR ML:** Create distributions that reflect real-world patterns:
-        - Geographic distribution: Mix of major and minor cities
-        - Temporal patterns: Realistic seasonal/business patterns in dates
-        - Price distributions: Follow realistic market pricing (not uniform random)
-        - Category frequencies: Some categories more common than others (Pareto principle)
-        - User behavior patterns: Realistic usage patterns and preferences
-
-    3. **SDV METADATA FORMAT:**
-        - The `metadata_dict` must have "tables" and "relationships" keys
-        - Use SDV format for relationships: "parent_table_name", "child_table_name", "parent_primary_key", "child_foreign_key"
-        - Every table MUST define a "primary_key" field
-
-    4. **DATETIME HANDLING:**
-        - All datetime columns use format: "datetime_format": "%Y-%m-%d %H:%M:%S"
-        - Provide realistic datetime values like "2023-06-15 14:30:00"
-        - NO placeholder text like '(datetime_format)', 'YYYY-MM-DD'
-
-    5. **SEED DATA REQUIREMENTS:**
-        - Provide 25-30 diverse, realistic data rows per table
-        - Ensure all foreign key relationships are valid and meaningful
-        - Use varied, realistic values that represent good training data diversity
-        - Make sure data follows domain-specific patterns (e.g., subscription dates before end dates)
-
-    6. **QUALITY VALIDATION:**
-        - NO coded values (AAA1, BBB2, etc.) - use meaningful names
-        - NO mixed alphanumeric in numeric fields (phone numbers, IDs where inappropriate)
-        - Ensure referential integrity between related tables
-        - Use realistic value ranges for all fields
-
-    **Output:** Return ONLY the complete JSON object with realistic, AI/ML-ready training data.
+    **CRITICAL INSTRUCTIONS (SDV Modern Format):**
+    1. The `metadata_dict` must have "tables" and "relationships" keys. 
+    **Relationships:** - Use SDV format: "parent_table_name", "child_table_name", "parent_primary_key", "child_foreign_key"
+    2. **PRIMARY KEY ENFORCEMENT:** For every table, you MUST define a "primary_key" field.
+    3. **DATA VALUE CONSTRAINTS:**
+        a. **DO NOT USE PLACEHOLDERS.** All date, time, and numerical fields in the `seed_tables_dict` MUST contain SPECIFIC, VALID DATA.
+        b. All columns defined as **"datetime" MUST use the full, consistent timestamp format: %Y-%m-%d %H:%M:%S**. 
+        c. Specifically, **NEVER** output the strings '(format)', 'YYYY', 'MM', 'DD', 'HH:MM:SS', 'Time', '(datetime_format)', or any placeholder text inside any data value.
+        d. **CRITICAL DATETIME FORMAT:** For datetime format strings in metadata, use EXACTLY: "datetime_format": "%Y-%m-%d %H:%M:%S" - NO parentheses, NO placeholder text, NO extra quotes around individual format codes.
+        e. **EXAMPLE CORRECT DATETIME METADATA:**
+           ```json
+           "date_of_birth": {{
+               "sdtype": "datetime",
+               "datetime_format": "%Y-%m-%d %H:%M:%S"
+           }}
+           ```
+        f. **EXAMPLE CORRECT DATETIME DATA:** "1990-05-15 10:30:00", "2023-12-01 14:22:33"
+    4. The `seed_tables_dict` must contain 20 realistic data rows for each table, ensuring all foreign key relationships are valid.
+    5. **VALIDATION:** Before outputting, verify that NO datetime format field contains placeholder text like "(datetime_format)" - it must be a valid strftime format string.
+    6. **Output:** Return ONLY the complete JSON object.
     """
 
     logger.info("Generating/Refining schema with Gemini...")
@@ -558,59 +526,22 @@ def generate_sdv_data_optimized(num_records: int, metadata_dict: Dict[str, Any],
                 raise ValueError(f"Synthesis failed for table '{table_name}': {e}")
 
         elif num_tables > 1 and has_relationships:
-            logger.info("Detected relational tables. Using optimized HMA synthesis for per-table record generation.")
+            logger.info("Detected relational tables. Using optimized HMA synthesis.")
             try:
-                # Clean referential integrity issues before synthesis
-                logger.info("Cleaning referential integrity issues in multi-table data...")
-                _update_progress("processing", "Cleaning referential integrity", 25)
-                
-                try:
-                    cleaned_seed_tables = drop_unknown_references(seed_tables, metadata)
-                    logger.info("Successfully cleaned unknown foreign key references")
-                except Exception as clean_error:
-                    logger.warning(f"Referential integrity cleaning failed: {clean_error}. Using original data.")
-                    cleaned_seed_tables = seed_tables
-                
                 synthesizer = HMASynthesizer(metadata)
                 
                 _update_progress("processing", "Training multi-table synthesizer", 30)
-                synthesizer.fit(cleaned_seed_tables)
+                synthesizer.fit(seed_tables)
 
-                # Calculate scale factor to generate approximately num_records per main table
-                # Find the main table (likely has most foreign keys pointing to it or largest seed data)
-                seed_row_counts = {name: len(df) for name, df in seed_tables.items()}
-                main_table = max(seed_row_counts, key=seed_row_counts.get)
-                main_table_seed_rows = seed_row_counts[main_table]
+                # Calculate optimal scale factor
+                total_seed_rows = sum(len(df) for df in seed_tables.values())
+                scale_factor = min(num_records / total_seed_rows if total_seed_rows > 0 else 1.0, 10.0)  # Cap scale factor
                 
-                # Scale based on main table to get desired records per table
-                scale_factor = max(num_records / main_table_seed_rows if main_table_seed_rows > 0 else 1.0, 1.0)
+                logger.info(f"Using optimized scale factor: {scale_factor:.2f}")
                 
-                # For very large requests, use multiple sampling iterations
-                if scale_factor > 15:  # If scale factor too high, do multiple samples
-                    iterations = max(1, int(scale_factor / 10))
-                    per_iteration_scale = scale_factor / iterations
-                    logger.info(f"Using {iterations} iterations with scale factor {per_iteration_scale:.2f} each")
-                    
-                    all_parts = []
-                    for iteration in range(iterations):
-                        _update_progress("processing", f"Generating relational data - iteration {iteration + 1}/{iterations}", 
-                                       60 + int(25 * iteration / iterations))
-                        sample_data = synthesizer.sample(scale=per_iteration_scale)
-                        all_parts.append(sample_data)
-                    
-                    # Combine iterations
-                    combined_data = {}
-                    for table_name in seed_tables.keys():
-                        table_parts = [part[table_name] for part in all_parts if table_name in part]
-                        if table_parts:
-                            combined_data[table_name] = pd.concat(table_parts, ignore_index=True)
-                    
-                    all_synthetic_data = combined_data
-                else:
-                    logger.info(f"Using optimized scale factor: {scale_factor:.2f} to generate ~{num_records} records per main table")
-                    _update_progress("processing", "Generating relational data", 60)
-                    synthetic_data = synthesizer.sample(scale=scale_factor)
-                    all_synthetic_data = synthetic_data
+                _update_progress("processing", "Generating relational data", 60)
+                synthetic_data = synthesizer.sample(scale=scale_factor)
+                all_synthetic_data = synthetic_data
                 
             except Exception as e:
                 logger.error(f"Multi-table synthesis failed: {e}")

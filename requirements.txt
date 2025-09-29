@@ -11,3 +11,6 @@ streamlit
 requests
 email-validator
 plotly
+psutil
+scipy
+numpy

@@ -21,15 +21,11 @@ from datetime import datetime
 import zipfile
 import io
 import tempfile
-import psutil
-from scipy import stats
-from collections import Counter
 
 # --- SDV IMPORTS ---
 from sdv.metadata import Metadata
 from sdv.single_table import GaussianCopulaSynthesizer, CTGANSynthesizer
 from sdv.multi_table import HMASynthesizer
-from sdv.utils import drop_unknown_references
 
 # --- GOOGLE CLOUD IMPORTS ---
 from google.cloud import storage
@@ -208,16 +204,8 @@ def validate_and_fix_json_response(response_text: str) -> Dict[str, Any]:
         fixed_text = re.sub(r'"%([YmdHMS])"', r'%\1', fixed_text)
         fixed_text = re.sub(r'"([^"]*%[YmdHMS][^"]*)"([^,}\]])', r'"\1"\2', fixed_text)
         
-        # Fix specific corruption patterns seen in logs
-        fixed_text = re.sub(r'"sdtype":dol":', r'"sdtype":', fixed_text)  # Fix "sdtype":dol": -> "sdtype":
-        fixed_text = re.sub(r'"([^"]*)":\s*([^",:}\]]+)":', r'"\1": "\2",', fixed_text)  # Fix malformed key-value pairs
-        fixed_text = re.sub(r':([a-zA-Z][a-zA-Z0-9_]*)":', r': "\1",', fixed_text)  # Fix unquoted values followed by quote-colon
-        
-        # Fix missing quotes around values that should be strings
-        fixed_text = re.sub(r':\s*([a-zA-Z][a-zA-Z0-9_]*)\s*([,}])', r': "\1"\2', fixed_text)
-        
         # Try multiple parsing attempts with different fixes
-        for attempt in range(4):
+        for attempt in range(3):
             try:
                 return json.loads(fixed_text)
             except json.JSONDecodeError as e2:
@@ -282,55 +270,23 @@ def call_ai_agent(data_description: str, existing_metadata_json: str = None) -> 
         raise HTTPException(status_code=500, detail=f"Failed to initialize Vertex AI: {e}")
 
     prompt = f"""
-    You are a professional data architect creating realistic datasets for AI/ML model training. Generate a single JSON object with two top-level keys: 'metadata_dict' and 'seed_tables_dict'.
+    You are a professional data architect. Generate a single JSON object with two top-level keys: 'metadata_dict' and 'seed_tables_dict'.
 
     **Core Request:** "{data_description}"
     
     {'**Refinement/Modification Instruction:** Based on the user\'s new description, modify the schema and seed data. Here is the existing metadata: ' + existing_metadata_json if existing_metadata_json else ''}
 
-    **CRITICAL DATA REALISM FOR AI/ML TRAINING:**
-    1. **REALISTIC DATA ONLY:** Generate data that looks like real-world data for AI/ML training:
-        - Names: Use real human names (John Smith, Sarah Johnson, etc.) - NO codes like 'AAA3', 'User123'
-        - Phone Numbers: Use proper formats (555-123-4567, +1-555-123-4567) - NO letters like '563Z778712L'
-        - Email Addresses: Realistic emails (john.smith@email.com, sarah.j@company.com)
-        - Addresses: Real street names, cities, states (123 Main St, New York, NY 10001)
-        - Company Names: Realistic business names (TechCorp Inc., Global Solutions LLC)
-        - Product Names: Meaningful product names (not Product1, Product2)
-        - Descriptions: Natural language descriptions, not codes or placeholders
-        - Categories: Use real-world categories and classifications
-        - Prices/Amounts: Realistic price ranges for the domain
-        - Dates: Meaningful date ranges that make business sense
-
-    2. **DATA DISTRIBUTION FOR ML:** Create distributions that reflect real-world patterns:
-        - Geographic distribution: Mix of major and minor cities
-        - Temporal patterns: Realistic seasonal/business patterns in dates
-        - Price distributions: Follow realistic market pricing (not uniform random)
-        - Category frequencies: Some categories more common than others (Pareto principle)
-        - User behavior patterns: Realistic usage patterns and preferences
-
-    3. **SDV METADATA FORMAT:**
-        - The `metadata_dict` must have "tables" and "relationships" keys
-        - Use SDV format for relationships: "parent_table_name", "child_table_name", "parent_primary_key", "child_foreign_key"
-        - Every table MUST define a "primary_key" field
-
-    4. **DATETIME HANDLING:**
-        - All datetime columns use format: "datetime_format": "%Y-%m-%d %H:%M:%S"
-        - Provide realistic datetime values like "2023-06-15 14:30:00"
-        - NO placeholder text like '(datetime_format)', 'YYYY-MM-DD'
-
-    5. **SEED DATA REQUIREMENTS:**
-        - Provide 25-30 diverse, realistic data rows per table
-        - Ensure all foreign key relationships are valid and meaningful
-        - Use varied, realistic values that represent good training data diversity
-        - Make sure data follows domain-specific patterns (e.g., subscription dates before end dates)
-
-    6. **QUALITY VALIDATION:**
-        - NO coded values (AAA1, BBB2, etc.) - use meaningful names
-        - NO mixed alphanumeric in numeric fields (phone numbers, IDs where inappropriate)
-        - Ensure referential integrity between related tables
-        - Use realistic value ranges for all fields
-
-    **Output:** Return ONLY the complete JSON object with realistic, AI/ML-ready training data.
+    **CRITICAL INSTRUCTIONS (SDV Modern Format):**
+    1. The `metadata_dict` must have "tables" and "relationships" keys. 
+    **Relationships:** - Use SDV format: "parent_table_name", "child_table_name", "parent_primary_key", "child_foreign_key"
+    2. **PRIMARY KEY ENFORCEMENT:** For every table, you MUST define a "primary_key" field.
+    3. **DATA VALUE CONSTRAINTS:**
+        a. **DO NOT USE PLACEHOLDERS.** All date, time, and numerical fields in the `seed_tables_dict` MUST contain SPECIFIC, VALID DATA.
+        b. All columns defined as **"datetime" MUST use the full, consistent timestamp format: %Y-%m-%d %H:%M:%S**. 
+        c. Specifically, **NEVER** output the strings '(format)', 'YYYY', or 'HH:MM:SS' inside any data value.
+        d. **CRITICAL:** For datetime format strings, use EXACTLY: "datetime_format": "%Y-%m-%d %H:%M:%S" - NO extra quotes around individual format codes.
+    4. The `seed_tables_dict` must contain 20 realistic data rows for each table, ensuring all foreign key relationships are valid.
+    5. **Output:** Return ONLY the complete JSON object.
     """
 
     logger.info("Generating/Refining schema with Gemini...")
@@ -558,59 +514,22 @@ def generate_sdv_data_optimized(num_records: int, metadata_dict: Dict[str, Any],
                 raise ValueError(f"Synthesis failed for table '{table_name}': {e}")
 
         elif num_tables > 1 and has_relationships:
-            logger.info("Detected relational tables. Using optimized HMA synthesis for per-table record generation.")
+            logger.info("Detected relational tables. Using optimized HMA synthesis.")
             try:
-                # Clean referential integrity issues before synthesis
-                logger.info("Cleaning referential integrity issues in multi-table data...")
-                _update_progress("processing", "Cleaning referential integrity", 25)
-                
-                try:
-                    cleaned_seed_tables = drop_unknown_references(seed_tables, metadata)
-                    logger.info("Successfully cleaned unknown foreign key references")
-                except Exception as clean_error:
-                    logger.warning(f"Referential integrity cleaning failed: {clean_error}. Using original data.")
-                    cleaned_seed_tables = seed_tables
-                
                 synthesizer = HMASynthesizer(metadata)
                 
                 _update_progress("processing", "Training multi-table synthesizer", 30)
-                synthesizer.fit(cleaned_seed_tables)
+                synthesizer.fit(seed_tables)
 
-                # Calculate scale factor to generate approximately num_records per main table
-                # Find the main table (likely has most foreign keys pointing to it or largest seed data)
-                seed_row_counts = {name: len(df) for name, df in seed_tables.items()}
-                main_table = max(seed_row_counts, key=seed_row_counts.get)
-                main_table_seed_rows = seed_row_counts[main_table]
+                # Calculate optimal scale factor
+                total_seed_rows = sum(len(df) for df in seed_tables.values())
+                scale_factor = min(num_records / total_seed_rows if total_seed_rows > 0 else 1.0, 10.0)  # Cap scale factor
                 
-                # Scale based on main table to get desired records per table
-                scale_factor = max(num_records / main_table_seed_rows if main_table_seed_rows > 0 else 1.0, 1.0)
+                logger.info(f"Using optimized scale factor: {scale_factor:.2f}")
                 
-                # For very large requests, use multiple sampling iterations
-                if scale_factor > 15:  # If scale factor too high, do multiple samples
-                    iterations = max(1, int(scale_factor / 10))
-                    per_iteration_scale = scale_factor / iterations
-                    logger.info(f"Using {iterations} iterations with scale factor {per_iteration_scale:.2f} each")
-                    
-                    all_parts = []
-                    for iteration in range(iterations):
-                        _update_progress("processing", f"Generating relational data - iteration {iteration + 1}/{iterations}", 
-                                       60 + int(25 * iteration / iterations))
-                        sample_data = synthesizer.sample(scale=per_iteration_scale)
-                        all_parts.append(sample_data)
-                    
-                    # Combine iterations
-                    combined_data = {}
-                    for table_name in seed_tables.keys():
-                        table_parts = [part[table_name] for part in all_parts if table_name in part]
-                        if table_parts:
-                            combined_data[table_name] = pd.concat(table_parts, ignore_index=True)
-                    
-                    all_synthetic_data = combined_data
-                else:
-                    logger.info(f"Using optimized scale factor: {scale_factor:.2f} to generate ~{num_records} records per main table")
-                    _update_progress("processing", "Generating relational data", 60)
-                    synthetic_data = synthesizer.sample(scale=scale_factor)
-                    all_synthetic_data = synthetic_data
+                _update_progress("processing", "Generating relational data", 60)
+                synthetic_data = synthesizer.sample(scale=scale_factor)
+                all_synthetic_data = synthetic_data
                 
             except Exception as e:
                 logger.error(f"Multi-table synthesis failed: {e}")
@@ -702,29 +621,8 @@ def run_synthesis_in_background(request: SynthesizeRequest):
         end_time = time.time()
         duration = end_time - start_time
         
-        # Generate comprehensive analysis and metrics
-        _update_progress("processing", "Generating analysis report", 95)
-        
-        synthesis_params = {
-            "batch_size": request.batch_size,
-            "use_fast_synthesizer": request.use_fast_synthesizer,
-            "num_records": request.num_records
-        }
-        
-        # Collect synthesis metrics
-        synthesis_metrics = collect_synthesis_metrics(
-            start_time, end_time, synthetic_data, request.metadata_dict, synthesis_params
-        )
-        
-        # Generate data distribution analysis
-        distribution_analysis = analyze_data_distribution(
-            synthetic_data, request.seed_tables_dict, request.metadata_dict
-        )
-        
         _update_cache({
             "synthetic_data": synthetic_data,
-            "synthesis_metrics": synthesis_metrics,
-            "distribution_analysis": distribution_analysis,
             "metadata": {
                 "total_records_generated": total_records,
                 "generation_time_seconds": duration,
@@ -755,259 +653,6 @@ def run_synthesis_in_background(request: SynthesizeRequest):
             "Failed",
             f"Synthetic data generation failed: {error_detail}"
         )
-
-def analyze_data_distribution(synthetic_data: Dict[str, pd.DataFrame], seed_data: Dict[str, List[Dict[str, Any]]], metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Comprehensive data distribution analysis comparing synthetic vs seed data.
-    """
-    logger.info("Starting comprehensive data distribution analysis...")
-    
-    analysis_report = {
-        "generation_timestamp": datetime.now().isoformat(),
-        "analysis_summary": {},
-        "table_analyses": {},
-        "statistical_tests": {},
-        "data_quality_metrics": {},
-        "synthesis_performance": {}
-    }
-    
-    try:
-        total_synthetic_records = sum(len(df) for df in synthetic_data.values())
-        total_seed_records = sum(len(records) for records in seed_data.values())
-        
-        # Overall summary
-        analysis_report["analysis_summary"] = {
-            "total_tables": len(synthetic_data),
-            "total_synthetic_records": total_synthetic_records,
-            "total_seed_records": total_seed_records,
-            "amplification_factor": round(total_synthetic_records / total_seed_records if total_seed_records > 0 else 0, 2),
-            "memory_usage_mb": round(sum(df.memory_usage(deep=True).sum() for df in synthetic_data.values()) / (1024 * 1024), 2)
-        }
-        
-        # Analyze each table
-        for table_name, synthetic_df in synthetic_data.items():
-            logger.info(f"Analyzing table: {table_name}")
-            
-            # Get corresponding seed data
-            seed_records = seed_data.get(table_name, [])
-            seed_df = pd.DataFrame.from_records(seed_records) if seed_records else pd.DataFrame()
-            
-            # Get table metadata
-            table_metadata = metadata_dict.get("tables", {}).get(table_name, {})
-            columns_metadata = table_metadata.get("columns", {})
-            
-            table_analysis = {
-                "basic_stats": {
-                    "synthetic_rows": len(synthetic_df),
-                    "synthetic_columns": len(synthetic_df.columns),
-                    "seed_rows": len(seed_df) if not seed_df.empty else 0,
-                    "missing_values": synthetic_df.isnull().sum().to_dict(),
-                    "duplicate_rows": synthetic_df.duplicated().sum(),
-                    "memory_usage_kb": round(synthetic_df.memory_usage(deep=True).sum() / 1024, 2)
-                },
-                "column_distributions": {},
-                "data_types_analysis": {},
-                "uniqueness_analysis": {},
-                "statistical_comparison": {}
-            }
-            
-            # Analyze each column
-            for col in synthetic_df.columns:
-                col_metadata = columns_metadata.get(col, {})
-                sdtype = col_metadata.get("sdtype", "unknown")
-                
-                synthetic_series = synthetic_df[col]
-                seed_series = seed_df[col] if not seed_df.empty and col in seed_df.columns else pd.Series()
-                
-                col_analysis = {
-                    "sdtype": sdtype,
-                    "data_type": str(synthetic_series.dtype),
-                    "unique_values": synthetic_series.nunique(),
-                    "uniqueness_ratio": round(synthetic_series.nunique() / len(synthetic_series), 4),
-                    "null_count": synthetic_series.isnull().sum(),
-                    "null_percentage": round(synthetic_series.isnull().sum() / len(synthetic_series) * 100, 2)
-                }
-                
-                # Type-specific analysis
-                if sdtype in ['numerical', 'integer'] or synthetic_series.dtype in ['int64', 'float64']:
-                    # Numerical analysis
-                    col_analysis.update({
-                        "min": float(synthetic_series.min()) if not synthetic_series.empty else None,
-                        "max": float(synthetic_series.max()) if not synthetic_series.empty else None,
-                        "mean": float(synthetic_series.mean()) if not synthetic_series.empty else None,
-                        "median": float(synthetic_series.median()) if not synthetic_series.empty else None,
-                        "std": float(synthetic_series.std()) if not synthetic_series.empty else None,
-                        "skewness": float(stats.skew(synthetic_series.dropna())) if len(synthetic_series.dropna()) > 0 else None,
-                        "kurtosis": float(stats.kurtosis(synthetic_series.dropna())) if len(synthetic_series.dropna()) > 0 else None,
-                        "percentiles": {
-                            "25th": float(synthetic_series.quantile(0.25)) if not synthetic_series.empty else None,
-                            "50th": float(synthetic_series.quantile(0.5)) if not synthetic_series.empty else None,
-                            "75th": float(synthetic_series.quantile(0.75)) if not synthetic_series.empty else None,
-                            "90th": float(synthetic_series.quantile(0.9)) if not synthetic_series.empty else None,
-                            "95th": float(synthetic_series.quantile(0.95)) if not synthetic_series.empty else None
-                        }
-                    })
-                    
-                    # Compare with seed data if available
-                    if not seed_series.empty and len(seed_series.dropna()) > 0:
-                        try:
-                            # Statistical tests
-                            ks_statistic, ks_p_value = stats.ks_2samp(synthetic_series.dropna(), seed_series.dropna())
-                            col_analysis["statistical_tests"] = {
-                                "kolmogorov_smirnov": {
-                                    "statistic": float(ks_statistic),
-                                    "p_value": float(ks_p_value),
-                                    "interpretation": "Similar distributions" if ks_p_value > 0.05 else "Different distributions"
-                                }
-                            }
-                            
-                            # Distribution comparison
-                            col_analysis["distribution_comparison"] = {
-                                "seed_mean": float(seed_series.mean()),
-                                "synthetic_mean": float(synthetic_series.mean()),
-                                "mean_difference": float(abs(synthetic_series.mean() - seed_series.mean())),
-                                "seed_std": float(seed_series.std()),
-                                "synthetic_std": float(synthetic_series.std()),
-                                "std_difference": float(abs(synthetic_series.std() - seed_series.std()))
-                            }
-                        except Exception as e:
-                            logger.warning(f"Statistical comparison failed for column {col}: {e}")
-                
-                elif sdtype == 'categorical' or synthetic_series.dtype == 'object':
-                    # Categorical analysis
-                    value_counts = synthetic_series.value_counts()
-                    col_analysis.update({
-                        "top_categories": value_counts.head(10).to_dict(),
-                        "category_count": len(value_counts),
-                        "entropy": float(stats.entropy(value_counts.values)) if len(value_counts) > 0 else None,
-                        "most_frequent": {
-                            "value": str(value_counts.index[0]) if len(value_counts) > 0 else None,
-                            "count": int(value_counts.iloc[0]) if len(value_counts) > 0 else None,
-                            "frequency": round(value_counts.iloc[0] / len(synthetic_series), 4) if len(value_counts) > 0 else None
-                        }
-                    })
-                    
-                    # Compare with seed data
-                    if not seed_series.empty:
-                        seed_value_counts = seed_series.value_counts()
-                        synthetic_categories = set(value_counts.index)
-                        seed_categories = set(seed_value_counts.index)
-                        
-                        col_analysis["category_comparison"] = {
-                            "seed_categories": len(seed_categories),
-                            "synthetic_categories": len(synthetic_categories),
-                            "new_categories": len(synthetic_categories - seed_categories),
-                            "preserved_categories": len(synthetic_categories & seed_categories),
-                            "jaccard_similarity": round(len(synthetic_categories & seed_categories) / len(synthetic_categories | seed_categories), 4) if len(synthetic_categories | seed_categories) > 0 else 0
-                        }
-                
-                elif sdtype == 'datetime':
-                    # Datetime analysis
-                    try:
-                        datetime_series = pd.to_datetime(synthetic_series, errors='coerce')
-                        col_analysis.update({
-                            "date_range": {
-                                "min_date": str(datetime_series.min()) if not datetime_series.isna().all() else None,
-                                "max_date": str(datetime_series.max()) if not datetime_series.isna().all() else None,
-                                "date_span_days": (datetime_series.max() - datetime_series.min()).days if not datetime_series.isna().all() else None
-                            },
-                            "temporal_patterns": {
-                                "year_distribution": datetime_series.dt.year.value_counts().head(10).to_dict() if not datetime_series.isna().all() else {},
-                                "month_distribution": datetime_series.dt.month.value_counts().to_dict() if not datetime_series.isna().all() else {},
-                                "day_of_week_distribution": datetime_series.dt.day_of_week.value_counts().to_dict() if not datetime_series.isna().all() else {}
-                            }
-                        })
-                    except Exception as e:
-                        logger.warning(f"Datetime analysis failed for column {col}: {e}")
-                
-                table_analysis["column_distributions"][col] = col_analysis
-            
-            # Data quality metrics
-            table_analysis["data_quality_metrics"] = {
-                "completeness_score": round((1 - synthetic_df.isnull().sum().sum() / (len(synthetic_df) * len(synthetic_df.columns))) * 100, 2),
-                "uniqueness_score": round(synthetic_df.nunique().sum() / (len(synthetic_df) * len(synthetic_df.columns)) * 100, 2),
-                "consistency_score": round((1 - synthetic_df.duplicated().sum() / len(synthetic_df)) * 100, 2) if len(synthetic_df) > 0 else 100
-            }
-            
-            analysis_report["table_analyses"][table_name] = table_analysis
-        
-        # Overall data quality assessment
-        avg_completeness = np.mean([table["data_quality_metrics"]["completeness_score"] for table in analysis_report["table_analyses"].values()])
-        avg_uniqueness = np.mean([table["data_quality_metrics"]["uniqueness_score"] for table in analysis_report["table_analyses"].values()])
-        avg_consistency = np.mean([table["data_quality_metrics"]["consistency_score"] for table in analysis_report["table_analyses"].values()])
-        
-        analysis_report["data_quality_metrics"] = {
-            "overall_completeness_score": round(avg_completeness, 2),
-            "overall_uniqueness_score": round(avg_uniqueness, 2),
-            "overall_consistency_score": round(avg_consistency, 2),
-            "overall_quality_score": round((avg_completeness + avg_uniqueness + avg_consistency) / 3, 2)
-        }
-        
-        logger.info("Data distribution analysis completed successfully")
-        return analysis_report
-        
-    except Exception as e:
-        logger.error(f"Error in data distribution analysis: {e}")
-        logger.error(f"Full traceback: {traceback.format_exc()}")
-        return {
-            "error": f"Analysis failed: {str(e)}",
-            "generation_timestamp": datetime.now().isoformat()
-        }
-
-def collect_synthesis_metrics(start_time: float, end_time: float, synthetic_data: Dict[str, pd.DataFrame], 
-                            metadata_dict: Dict[str, Any], synthesis_params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Collect comprehensive synthesis performance metrics.
-    """
-    logger.info("Collecting synthesis performance metrics...")
-    
-    try:
-        duration = end_time - start_time
-        total_records = sum(len(df) for df in synthetic_data.values())
-        total_memory = sum(df.memory_usage(deep=True).sum() for df in synthetic_data.values())
-        
-        # System metrics
-        cpu_percent = psutil.cpu_percent()
-        memory_info = psutil.virtual_memory()
-        
-        metrics = {
-            "performance_metrics": {
-                "synthesis_time_seconds": round(duration, 2),
-                "synthesis_time_formatted": f"{int(duration // 60)}m {int(duration % 60)}s",
-                "records_per_second": round(total_records / duration, 2) if duration > 0 else 0,
-                "memory_usage_mb": round(total_memory / (1024 * 1024), 2),
-                "throughput_mb_per_second": round((total_memory / (1024 * 1024)) / duration, 2) if duration > 0 else 0
-            },
-            "system_metrics": {
-                "cpu_usage_percent": cpu_percent,
-                "memory_total_gb": round(memory_info.total / (1024 ** 3), 2),
-                "memory_used_gb": round(memory_info.used / (1024 ** 3), 2),
-                "memory_available_gb": round(memory_info.available / (1024 ** 3), 2),
-                "memory_usage_percent": memory_info.percent
-            },
-            "synthesis_configuration": {
-                "batch_size": synthesis_params.get("batch_size", "N/A"),
-                "use_fast_synthesizer": synthesis_params.get("use_fast_synthesizer", "N/A"),
-                "synthesizer_type": "Optimized SDV",
-                "total_tables": len(synthetic_data),
-                "total_records_generated": total_records
-            },
-            "efficiency_metrics": {
-                "records_per_table": round(total_records / len(synthetic_data), 2) if len(synthetic_data) > 0 else 0,
-                "memory_per_record_bytes": round(total_memory / total_records, 2) if total_records > 0 else 0,
-                "generation_efficiency_score": round((total_records / duration) / (total_memory / (1024 * 1024)), 2) if duration > 0 and total_memory > 0 else 0
-            }
-        }
-        
-        logger.info("Synthesis metrics collection completed")
-        return metrics
-        
-    except Exception as e:
-        logger.error(f"Error collecting synthesis metrics: {e}")
-        return {
-            "error": f"Metrics collection failed: {str(e)}",
-            "timestamp": datetime.now().isoformat()
-        }
 
 def upload_to_gcs(bucket_name: str, synthetic_data: Dict[str, pd.DataFrame]):
     """
@@ -1299,23 +944,7 @@ def create_download_package() -> io.BytesIO:
                 zip_file.writestr("seed_data.json", seed_data_json)
                 logger.info("Added seed_data.json to download package")
             
-            # Add comprehensive analysis reports if available
-            synthesis_metrics = generated_data_cache.get("synthesis_metrics")
-            distribution_analysis = generated_data_cache.get("distribution_analysis")
-            
-            if synthesis_metrics:
-                metrics_json = json.dumps(synthesis_metrics, indent=2)
-                zip_file.writestr("synthesis_metrics.json", metrics_json)
-                logger.info("Added synthesis_metrics.json to download package")
-            
-            if distribution_analysis:
-                # Sanitize the distribution analysis to handle numpy types
-                sanitized_analysis = sanitize_for_json(distribution_analysis)
-                analysis_json = json.dumps(sanitized_analysis, indent=2)
-                zip_file.writestr("data_distribution_analysis.json", analysis_json)
-                logger.info("Added data_distribution_analysis.json to download package")
-            
-            # Add enhanced summary file
+            # Add summary file
             summary_info = {
                 "generation_timestamp": datetime.now().isoformat(),
                 "total_tables": len(synthetic_data),
@@ -1324,13 +953,11 @@ def create_download_package() -> io.BytesIO:
                     name: {"rows": len(df), "columns": df.columns.tolist()}
                     for name, df in synthetic_data.items()
                 },
-                "metadata_info": generated_data_cache.get("metadata", {}),
-                "quality_scores": distribution_analysis.get("data_quality_metrics", {}) if distribution_analysis else {},
-                "performance_metrics": synthesis_metrics.get("performance_metrics", {}) if synthesis_metrics else {}
+                "metadata_info": generated_data_cache.get("metadata", {})
             }
             summary_json = json.dumps(summary_info, indent=2)
             zip_file.writestr("generation_summary.json", summary_json)
-            logger.info("Added enhanced generation_summary.json to download package")
+            logger.info("Added generation_summary.json to download package")
         
         zip_buffer.seek(0)
         return zip_buffer
@@ -1468,133 +1095,6 @@ async def download_data_endpoint():
     except Exception as e:
         error_msg = f"Download failed: {str(e)}"
         logger.error(error_msg)
-        raise HTTPException(status_code=500, detail=error_msg)
-
-@app.get("/api/v1/reports")
-async def comprehensive_reports_endpoint(report_type: Optional[str] = None):
-    """NEW: Comprehensive data analysis and synthesis metrics reporting endpoint."""
-    try:
-        synthetic_data = generated_data_cache.get("synthetic_data")
-        synthesis_metrics = generated_data_cache.get("synthesis_metrics")
-        distribution_analysis = generated_data_cache.get("distribution_analysis")
-        
-        if synthetic_data == "Processing":
-            raise HTTPException(status_code=202, detail="Data synthesis is still processing in the background.")
-        
-        if not synthetic_data:
-            raise HTTPException(status_code=404, detail="No synthesized data available for reporting.")
-        
-        # Return specific report type if requested
-        if report_type:
-            if report_type.lower() == "metrics" or report_type.lower() == "synthesis_metrics":
-                if not synthesis_metrics:
-                    raise HTTPException(status_code=404, detail="Synthesis metrics not available.")
-                return sanitize_for_json({
-                    "report_type": "synthesis_metrics",
-                    "generated_at": datetime.now().isoformat(),
-                    "data": synthesis_metrics
-                })
-                
-            elif report_type.lower() == "distribution" or report_type.lower() == "analysis":
-                if not distribution_analysis:
-                    raise HTTPException(status_code=404, detail="Distribution analysis not available.")
-                return sanitize_for_json({
-                    "report_type": "distribution_analysis", 
-                    "generated_at": datetime.now().isoformat(),
-                    "data": distribution_analysis
-                })
-                
-            elif report_type.lower() == "summary":
-                # Generate executive summary
-                total_records = sum(len(df) for df in synthetic_data.values())
-                quality_score = distribution_analysis.get("data_quality_metrics", {}).get("overall_quality_score", "N/A") if distribution_analysis else "N/A"
-                generation_time = synthesis_metrics.get("performance_metrics", {}).get("synthesis_time_formatted", "N/A") if synthesis_metrics else "N/A"
-                
-                executive_summary = {
-                    "generation_overview": {
-                        "total_records_generated": total_records,
-                        "total_tables": len(synthetic_data),
-                        "generation_time": generation_time,
-                        "overall_quality_score": quality_score,
-                        "generation_timestamp": datetime.now().isoformat()
-                    },
-                    "table_summary": {
-                        name: {
-                            "rows": len(df),
-                            "columns": len(df.columns),
-                            "memory_mb": round(df.memory_usage(deep=True).sum() / (1024 * 1024), 2),
-                            "completeness": distribution_analysis.get("table_analyses", {}).get(name, {}).get("data_quality_metrics", {}).get("completeness_score", "N/A") if distribution_analysis else "N/A"
-                        }
-                        for name, df in synthetic_data.items()
-                    },
-                    "quality_highlights": {
-                        "highest_quality_table": None,
-                        "lowest_quality_table": None,
-                        "average_completeness": quality_score,
-                        "data_issues_detected": []
-                    }
-                }
-                
-                # Find highest/lowest quality tables
-                if distribution_analysis and "table_analyses" in distribution_analysis:
-                    table_qualities = {
-                        name: analysis.get("data_quality_metrics", {}).get("completeness_score", 0)
-                        for name, analysis in distribution_analysis["table_analyses"].items()
-                    }
-                    if table_qualities:
-                        executive_summary["quality_highlights"]["highest_quality_table"] = max(table_qualities, key=table_qualities.get)
-                        executive_summary["quality_highlights"]["lowest_quality_table"] = min(table_qualities, key=table_qualities.get)
-                
-                return sanitize_for_json({
-                    "report_type": "executive_summary",
-                    "generated_at": datetime.now().isoformat(),
-                    "data": executive_summary
-                })
-            else:
-                raise HTTPException(status_code=400, detail=f"Unknown report type: {report_type}. Available types: metrics, distribution, summary")
-        
-        # Return comprehensive report with all available data
-        comprehensive_report = {
-            "report_metadata": {
-                "generated_at": datetime.now().isoformat(),
-                "report_version": "1.0",
-                "total_tables_analyzed": len(synthetic_data),
-                "total_records_generated": sum(len(df) for df in synthetic_data.values())
-            },
-            "synthesis_metrics": synthesis_metrics,
-            "distribution_analysis": distribution_analysis,
-            "data_description": {
-                table_name: {
-                    "rows": len(df),
-                    "columns": df.columns.tolist(),
-                    "data_types": df.dtypes.astype(str).to_dict(),
-                    "memory_usage_mb": round(df.memory_usage(deep=True).sum() / (1024 * 1024), 2),
-                    "sample_data": df.head(5).to_dict('records') if len(df) > 0 else []
-                }
-                for table_name, df in synthetic_data.items()
-            },
-            "available_endpoints": {
-                "specific_reports": {
-                    "synthesis_metrics": "/api/v1/reports?report_type=metrics",
-                    "distribution_analysis": "/api/v1/reports?report_type=distribution", 
-                    "executive_summary": "/api/v1/reports?report_type=summary"
-                },
-                "data_access": {
-                    "sample_data": "/api/v1/sample",
-                    "download_package": "/api/v1/download",
-                    "progress_tracking": "/api/v1/progress"
-                }
-            }
-        }
-        
-        return sanitize_for_json(comprehensive_report)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        error_msg = f"Reports endpoint failed: {str(e)}"
-        logger.error(error_msg)
-        logger.error(f"Full traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=error_msg)
 
 # --- Health Check Endpoint ---
