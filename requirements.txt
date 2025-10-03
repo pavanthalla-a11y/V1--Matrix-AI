@@ -3,14 +3,14 @@ uvicorn
 pandas
 sdv
 pydantic
-google-cloud-storage
+#google-cloud-storage
 google-cloud-aiplatform
 google-auth
 vertexai
 streamlit
 requests
-email-validator
-plotly
+#email-validator
+#plotly
 psutil
 scipy
 numpy
