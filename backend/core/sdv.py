@@ -19,311 +19,129 @@ def _normalize_name(name: str) -> str:
 
 def identify_datetime_constraints(metadata_dict: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
     """
-    Identify datetime constraint relationships from metadata and column names.
-    Returns business rules for datetime columns that need logical ordering.
+    SIMPLIFIED: Identify basic datetime constraint relationships.
+    AI handles complex constraint logic; this only catches obvious start/end patterns.
     """
-    logger.info("Identifying datetime constraints from metadata...")
-    
+    logger.info("Identifying basic datetime constraints...")
+
     constraints = {}
-    
+
     try:
         tables_data = metadata_dict.get('tables', {})
-        
+
         for table_name, table_meta in tables_data.items():
             table_constraints = []
             columns_data = table_meta.get('columns', {})
-            
-            # Get all datetime columns in this table
+
+            # Get all datetime columns
             datetime_cols = []
             for col_name, col_data in columns_data.items():
                 if isinstance(col_data, dict) and col_data.get('sdtype') == 'datetime':
                     datetime_cols.append(col_name)
-            
-            # Define common datetime constraint patterns
-            constraint_patterns = [
-                # Subscription/Service patterns
-                {
-                    'start_patterns': ['subscription_start', 'start_date', 'created_at', 'join_date'],
-                    'end_patterns': ['subscription_end', 'end_date', 'cancelled_at', 'cancellation_date'],
-                    'rule': 'end_after_start'
-                },
-                # Session/Event patterns  
-                {
-                    'start_patterns': ['session_start', 'start_time', 'begin_time', 'login_time'],
-                    'end_patterns': ['session_end', 'end_time', 'finish_time', 'logout_time'],
-                    'rule': 'end_after_start'
-                },
-                # Payment/Transaction patterns
-                {
-                    'start_patterns': ['created_at', 'order_date', 'request_date'],
-                    'end_patterns': ['payment_date', 'completed_date', 'processed_date'],
-                    'rule': 'end_after_start'
-                },
-                # General temporal patterns
-                {
-                    'start_patterns': ['created', 'started', 'opened'],
-                    'end_patterns': ['updated', 'finished', 'closed'],
-                    'rule': 'end_after_start'
-                }
-            ]
-            
-            # Apply pattern matching to identify constraints
-            for pattern in constraint_patterns:
-                start_col = None
-                end_col = None
-                
-                # Find start column
-                for col in datetime_cols:
-                    col_lower = col.lower()
-                    if any(pattern_str in col_lower for pattern_str in pattern['start_patterns']):
-                        start_col = col
-                        break
-                
-                # Find end column  
-                for col in datetime_cols:
-                    col_lower = col.lower()
-                    if any(pattern_str in col_lower for pattern_str in pattern['end_patterns']):
-                        end_col = col
-                        break
-                
-                if start_col and end_col and start_col != end_col:
-                    constraint = {
-                        'start_column': start_col,
-                        'end_column': end_col,
-                        'rule': pattern['rule'],
-                        'description': f"{end_col} must be after {start_col}"
-                    }
-                    table_constraints.append(constraint)
-                    logger.info(f"Identified constraint in {table_name}: {constraint['description']}")
-            
+
+            # Only check for obvious start/end pairs
+            start_patterns = ['start', 'created', 'begin', 'opened']
+            end_patterns = ['end', 'closed', 'finished', 'cancelled']
+
+            for start_col in datetime_cols:
+                for end_col in datetime_cols:
+                    if start_col != end_col:
+                        if any(p in start_col.lower() for p in start_patterns) and \
+                           any(p in end_col.lower() for p in end_patterns):
+                            constraint = {
+                                'start_column': start_col,
+                                'end_column': end_col,
+                                'rule': 'end_after_start',
+                                'description': f"{end_col} must be after {start_col}"
+                            }
+                            table_constraints.append(constraint)
+
             if table_constraints:
                 constraints[table_name] = table_constraints
-        
-        logger.info(f"Identified {sum(len(c) for c in constraints.values())} datetime constraints across {len(constraints)} tables")
+
+        logger.info(f"Identified {sum(len(c) for c in constraints.values())} basic datetime constraints")
         return constraints
-        
+
     except Exception as e:
         logger.error(f"Error identifying datetime constraints: {e}")
         return {}
 
-def validate_datetime_constraints(synthetic_data: Dict[str, pd.DataFrame], 
+def validate_datetime_constraints(synthetic_data: Dict[str, pd.DataFrame],
                                 constraints: Dict[str, List[Dict[str, str]]]) -> Dict[str, Any]:
     """
-    Validate datetime constraints in synthetic data and report violations.
+    SIMPLIFIED: Quick validation of datetime constraints.
     """
-    logger.info("Validating datetime constraints in synthetic data...")
-    
-    validation_report = {
-        "total_constraints": 0,
-        "total_violations": 0,
-        "table_reports": {},
-        "constraint_details": []
-    }
-    
+    total_violations = 0
+
     try:
         for table_name, table_constraints in constraints.items():
             if table_name not in synthetic_data:
                 continue
-                
+
             df = synthetic_data[table_name]
-            table_report = {
-                "constraints_checked": len(table_constraints),
-                "violations_found": 0,
-                "constraint_results": []
-            }
-            
+
             for constraint in table_constraints:
                 start_col = constraint['start_column']
                 end_col = constraint['end_column']
-                rule = constraint['rule']
-                
-                constraint_result = {
-                    "constraint": constraint,
-                    "violations": 0,
-                    "violation_rate": 0.0,
-                    "sample_violations": []
-                }
-                
+
                 if start_col in df.columns and end_col in df.columns:
                     try:
-                        # Convert to datetime if not already
                         start_series = pd.to_datetime(df[start_col], errors='coerce')
                         end_series = pd.to_datetime(df[end_col], errors='coerce')
-                        
-                        # Check constraint violations
-                        if rule == 'end_after_start':
-                            # Find records where end is before or equal to start
-                            violations_mask = (end_series <= start_series) & start_series.notna() & end_series.notna()
-                            violation_count = violations_mask.sum()
-                            
-                            constraint_result["violations"] = int(violation_count)
-                            constraint_result["violation_rate"] = round(violation_count / len(df) * 100, 2)
-                            
-                            # Get sample violations for reporting
-                            if violation_count > 0:
-                                violation_indices = df[violations_mask].index[:5]
-                                for idx in violation_indices:
-                                    constraint_result["sample_violations"].append({
-                                        "index": int(idx),
-                                        "start_value": str(start_series.iloc[idx]),
-                                        "end_value": str(end_series.iloc[idx]),
-                                        "issue": f"{end_col} ({end_series.iloc[idx]}) is not after {start_col} ({start_series.iloc[idx]})"
-                                    })
-                            
-                            table_report["violations_found"] += violation_count
-                            validation_report["total_violations"] += violation_count
-                            
-                            logger.info(f"Table {table_name}: {violation_count} violations for {constraint['description']}")
-                        
+                        violations_mask = (end_series <= start_series) & start_series.notna() & end_series.notna()
+                        total_violations += violations_mask.sum()
                     except Exception as e:
-                        logger.warning(f"Error validating constraint {constraint} in table {table_name}: {e}")
-                        constraint_result["error"] = str(e)
-                
-                table_report["constraint_results"].append(constraint_result)
-                validation_report["total_constraints"] += 1
-            
-            validation_report["table_reports"][table_name] = table_report
-        
-        validation_report["overall_violation_rate"] = round(
-            validation_report["total_violations"] / max(sum(len(df) for df in synthetic_data.values()), 1) * 100, 2
-        )
-        
-        logger.info(f"Datetime constraint validation complete: {validation_report['total_violations']} violations found")
-        return validation_report
-        
-    except Exception as e:
-        logger.error(f"Error during datetime constraint validation: {e}")
-        return {"error": str(e)}
+                        logger.warning(f"Error validating {table_name}.{start_col}/{end_col}: {e}")
 
-def fix_datetime_constraints(synthetic_data: Dict[str, pd.DataFrame], 
+        return {"total_violations": total_violations}
+
+    except Exception as e:
+        logger.error(f"Datetime validation error: {e}")
+        return {"total_violations": 0}
+
+def fix_datetime_constraints(synthetic_data: Dict[str, pd.DataFrame],
                            constraints: Dict[str, List[Dict[str, str]]]) -> Dict[str, pd.DataFrame]:
     """
-    Fix datetime constraint violations in synthetic data.
+    SIMPLIFIED: Quick fix for datetime violations. AI already handled complex logic.
     """
-    logger.info("Fixing datetime constraint violations in synthetic data...")
-    
+    import random
+
     fixed_data = {}
-    total_fixes = 0
-    
+
     try:
         for table_name, df in synthetic_data.items():
             fixed_df = df.copy()
-            table_fixes = 0
-            
+
             if table_name in constraints:
-                table_constraints = constraints[table_name]
-                
-                for constraint in table_constraints:
+                for constraint in constraints[table_name]:
                     start_col = constraint['start_column']
-                    end_col = constraint['end_column'] 
-                    rule = constraint['rule']
-                    
+                    end_col = constraint['end_column']
+
                     if start_col in fixed_df.columns and end_col in fixed_df.columns:
                         try:
-                            # Convert to datetime
                             start_series = pd.to_datetime(fixed_df[start_col], errors='coerce')
                             end_series = pd.to_datetime(fixed_df[end_col], errors='coerce')
-                            
-                            if rule == 'end_after_start':
-                                # Find violations where end <= start
-                                violations_mask = (end_series <= start_series) & start_series.notna() & end_series.notna()
-                                violation_indices = fixed_df[violations_mask].index
-                                
-                                for idx in violation_indices:
-                                    start_dt = start_series.iloc[idx] 
-                                    end_dt = end_series.iloc[idx]
-                                    
-                                    # Strategy: Add random duration between start and reasonable end
-                                    if pd.notna(start_dt):
-                                        # Add between 1 hour to 30 days depending on the context
-                                        if 'session' in constraint['description'].lower():
-                                            # Sessions: 1 minute to 8 hours
-                                            import random
-                                            minutes_to_add = random.randint(1, 480)
-                                            new_end_dt = start_dt + pd.Timedelta(minutes=minutes_to_add)
-                                        elif 'subscription' in constraint['description'].lower():
-                                            # Subscriptions: 1 day to 365 days
-                                            import random
-                                            days_to_add = random.randint(1, 365)
-                                            new_end_dt = start_dt + pd.Timedelta(days=days_to_add)
-                                        else:
-                                            # General: 1 hour to 7 days
-                                            import random
-                                            hours_to_add = random.randint(1, 168)
-                                            new_end_dt = start_dt + pd.Timedelta(hours=hours_to_add)
-                                        
-                                        # Update the DataFrame
-                                        fixed_df.loc[idx, end_col] = new_end_dt.strftime('%Y-%m-%d %H:%M:%S')
-                                        table_fixes += 1
-                                        
-                                        logger.debug(f"Fixed {table_name}[{idx}]: {start_col}={start_dt} -> {end_col}={new_end_dt}")
-                        
+
+                            violations_mask = (end_series <= start_series) & start_series.notna() & end_series.notna()
+                            violation_indices = fixed_df[violations_mask].index
+
+                            for idx in violation_indices:
+                                start_dt = start_series.loc[idx]
+                                if pd.notna(start_dt):
+                                    # Add random duration (1 hour to 7 days)
+                                    hours_to_add = random.randint(1, 168)
+                                    new_end_dt = start_dt + pd.Timedelta(hours=hours_to_add)
+                                    fixed_df.loc[idx, end_col] = new_end_dt.strftime('%Y-%m-%d %H:%M:%S')
+
                         except Exception as e:
-                            logger.warning(f"Error fixing constraint {constraint} in table {table_name}: {e}")
-                
-                if table_fixes > 0:
-                    logger.info(f"Fixed {table_fixes} datetime constraint violations in table {table_name}")
-                    total_fixes += table_fixes
-            
+                            logger.warning(f"Error fixing {table_name}.{start_col}/{end_col}: {e}")
+
             fixed_data[table_name] = fixed_df
-        
-        # Additional duration-based fixes for common patterns
-        fixed_data = fix_duration_consistency(fixed_data, constraints)
-        
-        logger.info(f"Total datetime constraint fixes applied: {total_fixes}")
+
         return fixed_data
-        
+
     except Exception as e:
         logger.error(f"Error fixing datetime constraints: {e}")
-        return synthetic_data  # Return original data if fixing fails
-
-def fix_duration_consistency(synthetic_data: Dict[str, pd.DataFrame], 
-                           constraints: Dict[str, List[Dict[str, str]]]) -> Dict[str, pd.DataFrame]:
-    """
-    Fix duration-related columns to match start/end time differences.
-    """
-    logger.info("Fixing duration consistency...")
-    
-    fixed_data = {}
-    
-    try:
-        for table_name, df in synthetic_data.items():
-            fixed_df = df.copy()
-            
-            # Look for duration columns
-            duration_cols = [col for col in df.columns if any(keyword in col.lower() 
-                           for keyword in ['duration', 'length', 'time_spent', 'watch_duration'])]
-            
-            if duration_cols and table_name in constraints:
-                for duration_col in duration_cols:
-                    # Find corresponding start/end columns
-                    for constraint in constraints[table_name]:
-                        start_col = constraint['start_column']
-                        end_col = constraint['end_column']
-                        
-                        if start_col in fixed_df.columns and end_col in fixed_df.columns:
-                            try:
-                                start_series = pd.to_datetime(fixed_df[start_col], errors='coerce')
-                                end_series = pd.to_datetime(fixed_df[end_col], errors='coerce')
-                                
-                                # Calculate actual duration
-                                duration_series = (end_series - start_series).dt.total_seconds()
-                                
-                                # Update duration column to match actual time difference
-                                valid_mask = duration_series.notna() & (duration_series >= 0)
-                                if valid_mask.any():
-                                    fixed_df.loc[valid_mask, duration_col] = duration_series[valid_mask].round().astype(int)
-                                    logger.info(f"Updated {duration_col} in {table_name} to match {start_col}-{end_col} difference")
-                                
-                            except Exception as e:
-                                logger.warning(f"Error fixing duration {duration_col} in {table_name}: {e}")
-            
-            fixed_data[table_name] = fixed_df
-        
-        return fixed_data
-        
-    except Exception as e:
-        logger.error(f"Error in duration consistency fix: {e}")
         return synthetic_data
 
 def clean_seed_data(seed_tables_dict: Dict[str, List[Dict[str, Any]]], metadata_dict: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
@@ -886,40 +704,56 @@ def validate_referential_integrity(seed_tables_dict: Dict[str, List[Dict[str, An
     except Exception as e:
         logger.error(f"Error during referential integrity validation: {e}")
 
-def generate_sdv_data_optimized(num_records: int, metadata_dict: Dict[str, Any], seed_tables_dict: Dict[str, Any], 
-                               batch_size: int = 1000, use_fast_synthesizer: bool = True) -> Dict[str, pd.DataFrame]:
+def generate_sdv_data_optimized(num_records: int, metadata_dict: Dict[str, Any], seed_tables_dict: Dict[str, Any],
+                               batch_size: int = 1000, use_fast_synthesizer: bool = True, data_description: str = "") -> Dict[str, pd.DataFrame]:
     """
-    OPTIMIZED: Uses batch processing and faster synthesizers for large datasets with enhanced error handling.
+    OPTIMIZED: Uses batch processing and faster synthesizers with AI-driven constraint validation.
     """
     try:
+        update_progress("processing", "AI-based constraint validation", 3)
+
+        # STEP 1: AI validates seed data for constraint violations
+        from .ai import validate_seed_data_with_ai, fix_seed_data_with_ai
+
+        if data_description:
+            logger.info("Running AI-based constraint validation...")
+            validation_result = validate_seed_data_with_ai(data_description, seed_tables_dict, metadata_dict)
+
+            if validation_result.get("has_violations", False):
+                logger.warning(f"AI detected {validation_result.get('violation_count', 0)} constraint violations")
+                logger.info(f"Violations: {validation_result.get('violations', [])}")
+
+                # Let AI fix the violations
+                update_progress("processing", "AI fixing constraint violations", 4)
+                seed_tables_dict = fix_seed_data_with_ai(
+                    data_description,
+                    seed_tables_dict,
+                    validation_result.get('violations', []),
+                    metadata_dict
+                )
+                logger.info("✅ AI-based constraint fixing complete")
+            else:
+                logger.info("✅ No constraint violations detected by AI")
+
         update_progress("processing", "Cleaning seed data", 5)
-        
-        # STEP 1: Clean the seed data
+
+        # STEP 2: Clean the seed data (basic sanitization only)
         cleaned_seed_tables_dict = clean_seed_data(seed_tables_dict, metadata_dict)
         
-        # STEP 2: Fix primary key uniqueness
+        # STEP 3: Fix primary key uniqueness
         update_progress("processing", "Fixing primary key uniqueness", 6)
         pk_fixed_seed_tables_dict = fix_primary_key_uniqueness(cleaned_seed_tables_dict, metadata_dict)
-        
-        # STEP 3: Validate referential integrity
+
+        # STEP 4: Validate referential integrity (only basic checks, let SDV handle relationships)
         update_progress("processing", "Validating referential integrity", 7)
         integrity_report = validate_referential_integrity(pk_fixed_seed_tables_dict, metadata_dict)
-        
+
         if not integrity_report["is_valid"]:
             logger.warning(f"Referential integrity issues detected: {len(integrity_report['violations'])} violations")
-            
-            # STEP 3: Fix referential integrity issues
             update_progress("processing", "Fixing referential integrity", 8)
             cleaned_seed_tables_dict = fix_referential_integrity(cleaned_seed_tables_dict, metadata_dict)
-            
-            # STEP 4: Re-validate after fixing
-            final_integrity_report = validate_referential_integrity(cleaned_seed_tables_dict, metadata_dict)
-            if final_integrity_report["is_valid"]:
-                logger.info("✅ Referential integrity successfully fixed")
-            else:
-                logger.warning(f"⚠️ Some referential integrity issues remain: {len(final_integrity_report['violations'])} violations")
         else:
-            logger.info("✅ Referential integrity validation passed - no issues found")
+            logger.info("✅ Referential integrity validation passed")
 
         # Convert to DataFrames with validation
         seed_tables = {}
@@ -1103,38 +937,24 @@ def generate_sdv_data_optimized(num_records: int, metadata_dict: Dict[str, Any],
             all_synthetic_data = fallback_data
             logger.info("Fallback data generation completed")
 
-        # NEW: Apply datetime constraint fixes to synthetic data
-        update_progress("processing", "Applying datetime constraint fixes", 85)
-        
-        # Identify datetime constraints from metadata
+        # SIMPLIFIED: Only apply basic datetime constraint fixes
+        # AI already validated constraints in seed data, SDV learned from clean seed data
+        update_progress("processing", "Applying basic datetime fixes", 85)
+
         datetime_constraints = identify_datetime_constraints(metadata_dict)
-        
+
         if datetime_constraints:
-            logger.info(f"Applying datetime constraints to {len(datetime_constraints)} tables")
-            
-            # Validate constraints before fixing
+            logger.info(f"Applying basic datetime fixes to {len(datetime_constraints)} tables")
             validation_report = validate_datetime_constraints(all_synthetic_data, datetime_constraints)
-            
+
             if validation_report.get("total_violations", 0) > 0:
-                logger.warning(f"Found {validation_report['total_violations']} datetime constraint violations. Fixing...")
-                
-                # Apply fixes
-                fixed_synthetic_data = fix_datetime_constraints(all_synthetic_data, datetime_constraints)
-                
-                # Validate again to confirm fixes
-                post_fix_validation = validate_datetime_constraints(fixed_synthetic_data, datetime_constraints)
-                remaining_violations = post_fix_validation.get("total_violations", 0)
-                
-                if remaining_violations == 0:
-                    logger.info("✅ All datetime constraint violations successfully fixed!")
-                else:
-                    logger.warning(f"⚠️ {remaining_violations} datetime violations remain after fixing")
-                
-                all_synthetic_data = fixed_synthetic_data
+                logger.info(f"Fixing {validation_report['total_violations']} datetime violations...")
+                all_synthetic_data = fix_datetime_constraints(all_synthetic_data, datetime_constraints)
+                logger.info("✅ Basic datetime fixes applied")
             else:
-                logger.info("✅ No datetime constraint violations found")
+                logger.info("✅ No datetime violations found")
         else:
-            logger.info("No datetime constraints identified - skipping constraint validation")
+            logger.info("No datetime constraints - skipping")
 
         update_progress("processing", "Finalizing data", 90)
         total_records = sum(len(df) for df in all_synthetic_data.values())

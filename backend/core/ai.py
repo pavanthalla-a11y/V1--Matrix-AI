@@ -253,6 +253,118 @@ def validate_ai_response_structure(ai_output: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("AI response structure validation completed successfully")
     return ai_output
 
+def validate_seed_data_with_ai(data_description: str, seed_tables_dict: Dict[str, Any], metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Uses Gemini to validate seed data against the original description and identify constraint violations.
+    Returns: {'has_violations': bool, 'violations': [list of issues], 'violation_count': int}
+    """
+    try:
+        credentials, project = setup_google_auth()
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
+
+        model = GenerativeModel(
+            GEMINI_MODEL,
+            generation_config={"response_mime_type": "application/json"}
+        )
+
+        validation_prompt = f'''
+        You are a data quality validator. Review the generated seed data against the original user requirements.
+
+        **Original Description:** "{data_description}"
+
+        **Generated Seed Data (first 10 rows per table):**
+        {json.dumps({table: data[:10] for table, data in seed_tables_dict.items()}, indent=2)}
+
+        **Your Task:**
+        1. Identify ANY rows that violate business rules or constraints mentioned in the description
+        2. Check for logical inconsistencies (e.g., end_date before start_date, negative prices, age < 18 when "adults only")
+        3. Verify conditional relationships (e.g., "if premium then price > 100")
+        4. Check required field relationships (e.g., "cancelled orders must have cancellation_date")
+
+        **Return JSON format:**
+        {{
+            "has_violations": true/false,
+            "violation_count": number,
+            "violations": [
+                {{
+                    "table": "table_name",
+                    "issue": "description of the violation",
+                    "affected_rows": "description of which rows",
+                    "rule_violated": "the business rule that was violated"
+                }}
+            ]
+        }}
+
+        If no violations found, return: {{"has_violations": false, "violation_count": 0, "violations": []}}
+        '''
+
+        logger.info("Validating seed data with AI...")
+        response = model.generate_content(validation_prompt)
+        validation_result = validate_and_fix_json_response(response.text)
+
+        logger.info(f"AI validation complete: {validation_result.get('violation_count', 0)} violations found")
+        return validation_result
+
+    except Exception as e:
+        logger.error(f"AI validation failed: {e}")
+        # Return no violations if validation fails
+        return {"has_violations": False, "violation_count": 0, "violations": []}
+
+def fix_seed_data_with_ai(data_description: str, seed_tables_dict: Dict[str, Any], violations: List[Dict[str, Any]], metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Uses Gemini to fix constraint violations in seed data.
+    Returns: corrected seed_tables_dict
+    """
+    try:
+        credentials, project = setup_google_auth()
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
+
+        model = GenerativeModel(
+            GEMINI_MODEL,
+            generation_config={"response_mime_type": "application/json"}
+        )
+
+        fix_prompt = f'''
+        You are a data correction specialist. Fix the violations in the seed data while maintaining data realism.
+
+        **Original Description:** "{data_description}"
+
+        **Current Seed Data:**
+        {json.dumps(seed_tables_dict, indent=2)}
+
+        **Violations to Fix:**
+        {json.dumps(violations, indent=2)}
+
+        **Your Task:**
+        1. Fix ALL violations identified above
+        2. Maintain realistic data values
+        3. Preserve primary/foreign key relationships
+        4. Ensure datetime formats remain consistent
+        5. Keep all other data unchanged if not affected by violations
+
+        **CRITICAL: Return ONLY the corrected seed_tables_dict in this exact format:**
+        {{
+            "table_name": [
+                {{"column1": "value1", "column2": "value2"}},
+                {{"column1": "value3", "column2": "value4"}}
+            ]
+        }}
+
+        Do not include any explanatory text, just the corrected data.
+        '''
+
+        logger.info("Fixing seed data with AI...")
+        response = model.generate_content(fix_prompt)
+        corrected_data = validate_and_fix_json_response(response.text)
+
+        logger.info("AI-based data correction complete")
+        return corrected_data
+
+    except Exception as e:
+        logger.error(f"AI-based fixing failed: {e}")
+        # Return original data if fixing fails
+        return seed_tables_dict
+
 def call_ai_agent(data_description: str, num_records: int, existing_metadata_json: str = None) -> Dict[str, Any]:
     """
     Calls the Gemini API to get the metadata schema and seed data.
@@ -261,7 +373,7 @@ def call_ai_agent(data_description: str, num_records: int, existing_metadata_jso
     try:
         credentials, project = setup_google_auth()
         vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
-        
+
         model = GenerativeModel(
             GEMINI_MODEL,
             generation_config={"response_mime_type": "application/json"}

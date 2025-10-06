@@ -55,7 +55,12 @@ async def design_schema_endpoint(request: DesignRequest):
             call_ai_agent, request.data_description, request.num_records, existing_metadata_json
         )
 
-        update_cache({"design_output": ai_output, "num_records_target": request.num_records})
+        # Store the original description for constraint validation later
+        update_cache({
+            "design_output": ai_output,
+            "num_records_target": request.num_records,
+            "data_description": request.data_description
+        })
 
         return {
             "status": "review_required",
@@ -180,6 +185,10 @@ async def run_synthesis_in_background(request: SynthesizeRequest):
         start_time = time.time()
         update_progress("processing", "Starting synthesis", 0)
 
+        # Get the original data description from cache for AI constraint validation
+        cache = get_cache()
+        data_description = cache.get("data_description", "")
+
         synthetic_data = await asyncio.to_thread(
             generate_sdv_data_optimized,
             request.num_records,
@@ -187,6 +196,7 @@ async def run_synthesis_in_background(request: SynthesizeRequest):
             request.seed_tables_dict,
             request.batch_size,
             request.use_fast_synthesizer,
+            data_description  # Pass description for AI validation
         )
 
         total_records = sum(len(df) for df in synthetic_data.values())

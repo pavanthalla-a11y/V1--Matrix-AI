@@ -2,6 +2,8 @@
 
 Matrix AI is a high-performance, AI-powered synthetic data generation tool that leverages Google's Gemini Pro and the Synthetic Data Vault (SDV) library. It provides a streamlined, four-step process to describe, design, synthesize, and download realistic, tabular data for AI/ML model training, testing, and data augmentation.
 
+For a detailed technical overview of the project, including architecture, data schemas, and API endpoints, please refer to the [Project Context](project_context.md) file.
+
 ## Features
 
 *   **AI-Powered Schema Design:** Describe your desired dataset in natural language, and Matrix AI's Gemini-powered agent will automatically generate the relational schema and realistic seed data.
@@ -12,33 +14,6 @@ Matrix AI is a high-performance, AI-powered synthetic data generation tool that 
 *   **Asynchronous Processing:** Data synthesis runs as a background task, allowing users to monitor progress and receive email notifications upon completion.
 *   **Comprehensive Reporting:** After synthesis, the tool provides detailed reports on data distribution and generation metrics.
 *   **Easy Download:** Download the complete dataset, including all tables and reports, as a single ZIP file.
-
-## Technologies Used
-
-*   **Backend:**
-    *   [FastAPI](https://fastapi.tiangolo.com/): A modern, fast (high-performance) web framework for building APIs with Python.
-    *   [Uvicorn](https://www.uvicorn.org/): A lightning-fast ASGI server implementation.
-    *   [Vertex AI](https://cloud.google.com/vertex-ai): Google's unified AI platform, used to access the Gemini Pro model.
-    *   [Synthetic Data Vault (SDV)](https://sdv.dev/): A Python library for generating synthetic data.
-    *   [Pandas](https://pandas.pydata.org/): A powerful data manipulation and analysis library.
-*   **Frontend:**
-    *   [Streamlit](https://streamlit.io/): A fast and easy way to create data apps in Python.
-*   **Authentication:**
-    *   [Google Auth](https://google-auth.readthedocs.io/en/master/): Google Authentication Library for Python.
-
-## Architecture
-
-The application is composed of two main components:
-
-1.  **Backend (FastAPI):**
-    *   Exposes a RESTful API for designing the schema, synthesizing the data, and retrieving reports.
-    *   Interacts with the Vertex AI API to communicate with the Gemini Pro model for schema generation.
-    *   Uses the SDV library to perform the data synthesis.
-    *   Manages the state of the generation process using an in-memory cache.
-2.  **Frontend (Streamlit):**
-    *   Provides a user-friendly, step-by-step interface for the data generation process.
-    *   Communicates with the backend API to trigger the different stages of the process.
-    *   Displays previews of the generated schema, seed data, and final synthetic data.
 
 ## Installation and Setup
 
@@ -87,40 +62,3 @@ The application is composed of two main components:
 
 5.  **Step 4: Download:**
     *   Download the complete synthetic dataset and reports as a ZIP file.
-
-## Project Structure
-
-```
-/home/pavan_thalla/dev/V1--Matrix-AI/
-├───.dockerignore
-├───.gitignore
-├───Dockerfile
-├───requirements.txt
-├───run.sh
-├───backend/
-│   ├───main.py             # FastAPI application entry point
-│   └───core/
-│       ├───ai.py           # Logic for interacting with the Gemini AI model
-│       ├───analytics.py    # Data analysis and reporting functions
-│       ├───cache.py        # In-memory cache for storing job status
-│       ├───config.py       # Configuration settings
-│       ├───google_auth.py  # Google Cloud authentication helper
-│       ├───notifications.py# Email notification logic
-│       ├───schemas.py      # Pydantic schemas for API requests and responses
-│       └───sdv.py          # Synthetic Data Vault (SDV) generation logic
-├───frontend/
-│   ├───api.py              # Functions for making API calls to the backend
-│   ├───app.py              # Main Streamlit application file
-│   ├───styles.py           # CSS styles for the Streamlit app
-│   └───components/
-│       ├───sidebar.py      # Renders the sidebar in the Streamlit app
-│       └───steps.py        # Renders the different steps in the UI
-└───frontend_v1/            # (Older version of the frontend)
-    ├───api.py
-    ├───app.py
-    ├───styles.py
-    └───components/
-        ├───sidebar.py
-        ├───stepper.py
-        └───steps.py
-```
