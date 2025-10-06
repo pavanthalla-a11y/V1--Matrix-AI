@@ -3,6 +3,7 @@ import numpy as np
 import uuid
 import gc
 import logging
+import traceback
 from typing import Dict, Any, List
 from sdv.metadata import Metadata
 from sdv.single_table import GaussianCopulaSynthesizer
@@ -11,6 +12,319 @@ from sdv.utils import drop_unknown_references
 from .cache import update_progress
 
 logger = logging.getLogger(__name__)
+
+def _normalize_name(name: str) -> str:
+    """Converts a string to snake_case."""
+    return name.lower().replace(" ", "_")
+
+def identify_datetime_constraints(metadata_dict: Dict[str, Any]) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Identify datetime constraint relationships from metadata and column names.
+    Returns business rules for datetime columns that need logical ordering.
+    """
+    logger.info("Identifying datetime constraints from metadata...")
+    
+    constraints = {}
+    
+    try:
+        tables_data = metadata_dict.get('tables', {})
+        
+        for table_name, table_meta in tables_data.items():
+            table_constraints = []
+            columns_data = table_meta.get('columns', {})
+            
+            # Get all datetime columns in this table
+            datetime_cols = []
+            for col_name, col_data in columns_data.items():
+                if isinstance(col_data, dict) and col_data.get('sdtype') == 'datetime':
+                    datetime_cols.append(col_name)
+            
+            # Define common datetime constraint patterns
+            constraint_patterns = [
+                # Subscription/Service patterns
+                {
+                    'start_patterns': ['subscription_start', 'start_date', 'created_at', 'join_date'],
+                    'end_patterns': ['subscription_end', 'end_date', 'cancelled_at', 'cancellation_date'],
+                    'rule': 'end_after_start'
+                },
+                # Session/Event patterns  
+                {
+                    'start_patterns': ['session_start', 'start_time', 'begin_time', 'login_time'],
+                    'end_patterns': ['session_end', 'end_time', 'finish_time', 'logout_time'],
+                    'rule': 'end_after_start'
+                },
+                # Payment/Transaction patterns
+                {
+                    'start_patterns': ['created_at', 'order_date', 'request_date'],
+                    'end_patterns': ['payment_date', 'completed_date', 'processed_date'],
+                    'rule': 'end_after_start'
+                },
+                # General temporal patterns
+                {
+                    'start_patterns': ['created', 'started', 'opened'],
+                    'end_patterns': ['updated', 'finished', 'closed'],
+                    'rule': 'end_after_start'
+                }
+            ]
+            
+            # Apply pattern matching to identify constraints
+            for pattern in constraint_patterns:
+                start_col = None
+                end_col = None
+                
+                # Find start column
+                for col in datetime_cols:
+                    col_lower = col.lower()
+                    if any(pattern_str in col_lower for pattern_str in pattern['start_patterns']):
+                        start_col = col
+                        break
+                
+                # Find end column  
+                for col in datetime_cols:
+                    col_lower = col.lower()
+                    if any(pattern_str in col_lower for pattern_str in pattern['end_patterns']):
+                        end_col = col
+                        break
+                
+                if start_col and end_col and start_col != end_col:
+                    constraint = {
+                        'start_column': start_col,
+                        'end_column': end_col,
+                        'rule': pattern['rule'],
+                        'description': f"{end_col} must be after {start_col}"
+                    }
+                    table_constraints.append(constraint)
+                    logger.info(f"Identified constraint in {table_name}: {constraint['description']}")
+            
+            if table_constraints:
+                constraints[table_name] = table_constraints
+        
+        logger.info(f"Identified {sum(len(c) for c in constraints.values())} datetime constraints across {len(constraints)} tables")
+        return constraints
+        
+    except Exception as e:
+        logger.error(f"Error identifying datetime constraints: {e}")
+        return {}
+
+def validate_datetime_constraints(synthetic_data: Dict[str, pd.DataFrame], 
+                                constraints: Dict[str, List[Dict[str, str]]]) -> Dict[str, Any]:
+    """
+    Validate datetime constraints in synthetic data and report violations.
+    """
+    logger.info("Validating datetime constraints in synthetic data...")
+    
+    validation_report = {
+        "total_constraints": 0,
+        "total_violations": 0,
+        "table_reports": {},
+        "constraint_details": []
+    }
+    
+    try:
+        for table_name, table_constraints in constraints.items():
+            if table_name not in synthetic_data:
+                continue
+                
+            df = synthetic_data[table_name]
+            table_report = {
+                "constraints_checked": len(table_constraints),
+                "violations_found": 0,
+                "constraint_results": []
+            }
+            
+            for constraint in table_constraints:
+                start_col = constraint['start_column']
+                end_col = constraint['end_column']
+                rule = constraint['rule']
+                
+                constraint_result = {
+                    "constraint": constraint,
+                    "violations": 0,
+                    "violation_rate": 0.0,
+                    "sample_violations": []
+                }
+                
+                if start_col in df.columns and end_col in df.columns:
+                    try:
+                        # Convert to datetime if not already
+                        start_series = pd.to_datetime(df[start_col], errors='coerce')
+                        end_series = pd.to_datetime(df[end_col], errors='coerce')
+                        
+                        # Check constraint violations
+                        if rule == 'end_after_start':
+                            # Find records where end is before or equal to start
+                            violations_mask = (end_series <= start_series) & start_series.notna() & end_series.notna()
+                            violation_count = violations_mask.sum()
+                            
+                            constraint_result["violations"] = int(violation_count)
+                            constraint_result["violation_rate"] = round(violation_count / len(df) * 100, 2)
+                            
+                            # Get sample violations for reporting
+                            if violation_count > 0:
+                                violation_indices = df[violations_mask].index[:5]
+                                for idx in violation_indices:
+                                    constraint_result["sample_violations"].append({
+                                        "index": int(idx),
+                                        "start_value": str(start_series.iloc[idx]),
+                                        "end_value": str(end_series.iloc[idx]),
+                                        "issue": f"{end_col} ({end_series.iloc[idx]}) is not after {start_col} ({start_series.iloc[idx]})"
+                                    })
+                            
+                            table_report["violations_found"] += violation_count
+                            validation_report["total_violations"] += violation_count
+                            
+                            logger.info(f"Table {table_name}: {violation_count} violations for {constraint['description']}")
+                        
+                    except Exception as e:
+                        logger.warning(f"Error validating constraint {constraint} in table {table_name}: {e}")
+                        constraint_result["error"] = str(e)
+                
+                table_report["constraint_results"].append(constraint_result)
+                validation_report["total_constraints"] += 1
+            
+            validation_report["table_reports"][table_name] = table_report
+        
+        validation_report["overall_violation_rate"] = round(
+            validation_report["total_violations"] / max(sum(len(df) for df in synthetic_data.values()), 1) * 100, 2
+        )
+        
+        logger.info(f"Datetime constraint validation complete: {validation_report['total_violations']} violations found")
+        return validation_report
+        
+    except Exception as e:
+        logger.error(f"Error during datetime constraint validation: {e}")
+        return {"error": str(e)}
+
+def fix_datetime_constraints(synthetic_data: Dict[str, pd.DataFrame], 
+                           constraints: Dict[str, List[Dict[str, str]]]) -> Dict[str, pd.DataFrame]:
+    """
+    Fix datetime constraint violations in synthetic data.
+    """
+    logger.info("Fixing datetime constraint violations in synthetic data...")
+    
+    fixed_data = {}
+    total_fixes = 0
+    
+    try:
+        for table_name, df in synthetic_data.items():
+            fixed_df = df.copy()
+            table_fixes = 0
+            
+            if table_name in constraints:
+                table_constraints = constraints[table_name]
+                
+                for constraint in table_constraints:
+                    start_col = constraint['start_column']
+                    end_col = constraint['end_column'] 
+                    rule = constraint['rule']
+                    
+                    if start_col in fixed_df.columns and end_col in fixed_df.columns:
+                        try:
+                            # Convert to datetime
+                            start_series = pd.to_datetime(fixed_df[start_col], errors='coerce')
+                            end_series = pd.to_datetime(fixed_df[end_col], errors='coerce')
+                            
+                            if rule == 'end_after_start':
+                                # Find violations where end <= start
+                                violations_mask = (end_series <= start_series) & start_series.notna() & end_series.notna()
+                                violation_indices = fixed_df[violations_mask].index
+                                
+                                for idx in violation_indices:
+                                    start_dt = start_series.iloc[idx] 
+                                    end_dt = end_series.iloc[idx]
+                                    
+                                    # Strategy: Add random duration between start and reasonable end
+                                    if pd.notna(start_dt):
+                                        # Add between 1 hour to 30 days depending on the context
+                                        if 'session' in constraint['description'].lower():
+                                            # Sessions: 1 minute to 8 hours
+                                            import random
+                                            minutes_to_add = random.randint(1, 480)
+                                            new_end_dt = start_dt + pd.Timedelta(minutes=minutes_to_add)
+                                        elif 'subscription' in constraint['description'].lower():
+                                            # Subscriptions: 1 day to 365 days
+                                            import random
+                                            days_to_add = random.randint(1, 365)
+                                            new_end_dt = start_dt + pd.Timedelta(days=days_to_add)
+                                        else:
+                                            # General: 1 hour to 7 days
+                                            import random
+                                            hours_to_add = random.randint(1, 168)
+                                            new_end_dt = start_dt + pd.Timedelta(hours=hours_to_add)
+                                        
+                                        # Update the DataFrame
+                                        fixed_df.loc[idx, end_col] = new_end_dt.strftime('%Y-%m-%d %H:%M:%S')
+                                        table_fixes += 1
+                                        
+                                        logger.debug(f"Fixed {table_name}[{idx}]: {start_col}={start_dt} -> {end_col}={new_end_dt}")
+                        
+                        except Exception as e:
+                            logger.warning(f"Error fixing constraint {constraint} in table {table_name}: {e}")
+                
+                if table_fixes > 0:
+                    logger.info(f"Fixed {table_fixes} datetime constraint violations in table {table_name}")
+                    total_fixes += table_fixes
+            
+            fixed_data[table_name] = fixed_df
+        
+        # Additional duration-based fixes for common patterns
+        fixed_data = fix_duration_consistency(fixed_data, constraints)
+        
+        logger.info(f"Total datetime constraint fixes applied: {total_fixes}")
+        return fixed_data
+        
+    except Exception as e:
+        logger.error(f"Error fixing datetime constraints: {e}")
+        return synthetic_data  # Return original data if fixing fails
+
+def fix_duration_consistency(synthetic_data: Dict[str, pd.DataFrame], 
+                           constraints: Dict[str, List[Dict[str, str]]]) -> Dict[str, pd.DataFrame]:
+    """
+    Fix duration-related columns to match start/end time differences.
+    """
+    logger.info("Fixing duration consistency...")
+    
+    fixed_data = {}
+    
+    try:
+        for table_name, df in synthetic_data.items():
+            fixed_df = df.copy()
+            
+            # Look for duration columns
+            duration_cols = [col for col in df.columns if any(keyword in col.lower() 
+                           for keyword in ['duration', 'length', 'time_spent', 'watch_duration'])]
+            
+            if duration_cols and table_name in constraints:
+                for duration_col in duration_cols:
+                    # Find corresponding start/end columns
+                    for constraint in constraints[table_name]:
+                        start_col = constraint['start_column']
+                        end_col = constraint['end_column']
+                        
+                        if start_col in fixed_df.columns and end_col in fixed_df.columns:
+                            try:
+                                start_series = pd.to_datetime(fixed_df[start_col], errors='coerce')
+                                end_series = pd.to_datetime(fixed_df[end_col], errors='coerce')
+                                
+                                # Calculate actual duration
+                                duration_series = (end_series - start_series).dt.total_seconds()
+                                
+                                # Update duration column to match actual time difference
+                                valid_mask = duration_series.notna() & (duration_series >= 0)
+                                if valid_mask.any():
+                                    fixed_df.loc[valid_mask, duration_col] = duration_series[valid_mask].round().astype(int)
+                                    logger.info(f"Updated {duration_col} in {table_name} to match {start_col}-{end_col} difference")
+                                
+                            except Exception as e:
+                                logger.warning(f"Error fixing duration {duration_col} in {table_name}: {e}")
+            
+            fixed_data[table_name] = fixed_df
+        
+        return fixed_data
+        
+    except Exception as e:
+        logger.error(f"Error in duration consistency fix: {e}")
+        return synthetic_data
 
 def clean_seed_data(seed_tables_dict: Dict[str, List[Dict[str, Any]]], metadata_dict: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
     """
@@ -46,7 +360,7 @@ def clean_seed_data(seed_tables_dict: Dict[str, List[Dict[str, Any]]], metadata_
         tables_dict = {}
         for table_info in tables_data:
             if isinstance(table_info, dict) and 'name' in table_info:
-                tables_dict[table_info['name']] = table_info
+                tables_dict[_normalize_name(table_info['name'])] = table_info
         tables_data = tables_dict
     
     for table_name, table_meta in tables_data.items():
@@ -58,29 +372,30 @@ def clean_seed_data(seed_tables_dict: Dict[str, List[Dict[str, Any]]], metadata_
             for col_name, col_data in columns_data.items():
                 if isinstance(col_data, dict) and col_data.get('sdtype') == 'datetime':
                     datetime_format = col_data.get('datetime_format', '%Y-%m-%d %H:%M:%S')
-                    datetime_cols[col_name] = datetime_format
+                    datetime_cols[_normalize_name(col_name)] = datetime_format
         elif isinstance(columns_data, list):
             for col_info in columns_data:
                 if isinstance(col_info, dict) and col_info.get('sdtype') == 'datetime':
                     datetime_format = col_info.get('datetime_format', '%Y-%m-%d %H:%M:%S')
                     col_name = col_info.get('name', '')
                     if col_name:
-                        datetime_cols[col_name] = datetime_format
+                        datetime_cols[_normalize_name(col_name)] = datetime_format
         
-        datetime_columns_by_table[table_name] = datetime_cols
+        datetime_columns_by_table[_normalize_name(table_name)] = datetime_cols
 
     for table_name, data_records in seed_tables_dict.items():
+        normalized_table_name = _normalize_name(table_name)
         if not data_records: 
-            cleaned_seed_tables[table_name] = []
+            cleaned_seed_tables[normalized_table_name] = []
             continue
         
         # Convert to DataFrame for easier manipulation
         cleaned_records = []
-        datetime_cols = datetime_columns_by_table.get(table_name, {})
+        datetime_cols = datetime_columns_by_table.get(normalized_table_name, {})
         
         for record_idx, record in enumerate(data_records):
             try:
-                cleaned_record = record.copy()
+                cleaned_record = {_normalize_name(k): v for k, v in record.items()}
                 
                 # CRITICAL DEMO FIX: Aggressive cleaning of datetime columns
                 for col, expected_format in datetime_cols.items():
@@ -178,7 +493,7 @@ def clean_seed_data(seed_tables_dict: Dict[str, List[Dict[str, Any]]], metadata_
                 continue
         
         logger.info(f"Table '{table_name}': Processed {len(cleaned_records)} records, cleaned {len(datetime_cols)} datetime columns")
-        cleaned_seed_tables[table_name] = cleaned_records
+        cleaned_seed_tables[normalized_table_name] = cleaned_records
 
     return cleaned_seed_tables
 
@@ -306,6 +621,7 @@ def repair_metadata_structure(metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
         tables_data = metadata_dict.get("tables", {})
         
         for table_name, table_info in tables_data.items():
+            normalized_table_name = _normalize_name(table_name)
             repaired_table = {
                 "columns": {},
                 "primary_key": None
@@ -314,6 +630,7 @@ def repair_metadata_structure(metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
             # Fix columns
             columns_data = table_info.get("columns", {})
             for col_name, col_info in columns_data.items():
+                normalized_col_name = _normalize_name(col_name)
                 if isinstance(col_info, dict):
                     # CRITICAL FIX: Repair malformed sdtype
                     sdtype = col_info.get("sdtype", "categorical")
@@ -321,9 +638,9 @@ def repair_metadata_structure(metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
                     # Fix common corrupted sdtype patterns
                     if sdtype == "sdtype" or sdtype == "" or sdtype is None:
                         sdtype = "categorical"  # Safe default
-                    elif "id" in col_name.lower():
+                    elif "id" in normalized_col_name:
                         sdtype = "id"
-                    elif "date" in col_name.lower() or "time" in col_name.lower():
+                    elif "date" in normalized_col_name or "time" in normalized_col_name:
                         sdtype = "datetime"
                     elif isinstance(sdtype, dict):
                         sdtype = "categorical"  # Fix dict corruption
@@ -334,22 +651,23 @@ def repair_metadata_structure(metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
                     if sdtype == "datetime":
                         repaired_col["datetime_format"] = col_info.get("datetime_format", "%Y-%m-%d %H:%M:%S")
                     
-                    repaired_table["columns"][col_name] = repaired_col
+                    repaired_table["columns"][normalized_col_name] = repaired_col
             
             # Ensure primary key exists
             primary_key = table_info.get("primary_key")
-            if not primary_key:
+            if primary_key:
+                repaired_table["primary_key"] = _normalize_name(primary_key)
+            else:
                 # Find likely primary key
                 for col_name in repaired_table["columns"].keys():
-                    if "id" in col_name.lower():
-                        primary_key = col_name
+                    if "id" in col_name:
+                        repaired_table["primary_key"] = col_name
                         break
-                if not primary_key:
+                if not repaired_table["primary_key"]:
                     # Use first column as fallback
                     primary_key = list(repaired_table["columns"].keys())[0] if repaired_table["columns"] else "id"
             
-            repaired_table["primary_key"] = primary_key
-            repaired_metadata["tables"][table_name] = repaired_table
+            repaired_metadata["tables"][normalized_table_name] = repaired_table
         
         # Fix relationships
         relationships = metadata_dict.get("relationships", [])
@@ -359,6 +677,10 @@ def repair_metadata_structure(metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(rel, dict) and all(k in rel for k in ["parent_table_name", "child_table_name", "parent_primary_key", "child_foreign_key"]):
                 # Only add if all required fields are valid strings
                 if all(isinstance(rel[k], str) and rel[k] != "sdtype" for k in ["parent_table_name", "child_table_name", "parent_primary_key", "child_foreign_key"]):
+                    rel["parent_table_name"] = _normalize_name(rel["parent_table_name"])
+                    rel["child_table_name"] = _normalize_name(rel["child_table_name"])
+                    rel["parent_primary_key"] = _normalize_name(rel["parent_primary_key"])
+                    rel["child_foreign_key"] = _normalize_name(rel["child_foreign_key"])
                     repaired_relationships.append(rel)
         
         repaired_metadata["relationships"] = repaired_relationships
@@ -430,6 +752,139 @@ def create_simplified_metadata(seed_tables: Dict[str, pd.DataFrame]) -> Dict[str
     
     logger.info(f"Simplified metadata created: {len(simplified_metadata['tables'])} tables")
     return simplified_metadata
+
+def validate_referential_integrity(seed_tables_dict: Dict[str, List[Dict[str, Any]]], metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validates and reports on referential integrity issues in the generated data.
+    Returns a detailed report of any integrity violations found.
+    """
+    logger.info("Validating referential integrity...")
+    
+    integrity_report = {
+        "is_valid": True,
+        "total_relationships": 0,
+        "violations": [],
+        "relationship_details": [],
+        "summary": {}
+    }
+    
+    try:
+        relationships = metadata_dict.get("relationships", [])
+        integrity_report["total_relationships"] = len(relationships)
+        
+        if not relationships:
+            integrity_report["summary"] = {"message": "No relationships defined - no integrity checks needed"}
+            return integrity_report
+        
+        for rel_idx, relationship in enumerate(relationships):
+            logger.info(f"Checking relationship {rel_idx + 1}: {relationship}")
+            
+            parent_table = relationship.get("parent_table_name")
+            child_table = relationship.get("child_table_name") 
+            parent_key = relationship.get("parent_primary_key")
+            child_key = relationship.get("child_foreign_key")
+            
+            rel_detail = {
+                "relationship_id": rel_idx + 1,
+                "parent_table": parent_table,
+                "child_table": child_table,
+                "parent_key": parent_key,
+                "child_key": child_key,
+                "status": "valid",
+                "issues": []
+            }
+            
+            # Check if tables exist in seed data
+            if parent_table not in seed_tables_dict:
+                issue = f"Parent table '{parent_table}' not found in seed data"
+                rel_detail["issues"].append(issue)
+                integrity_report["violations"].append(issue)
+                rel_detail["status"] = "invalid"
+                continue
+                
+            if child_table not in seed_tables_dict:
+                issue = f"Child table '{child_table}' not found in seed data"
+                rel_detail["issues"].append(issue)
+                integrity_report["violations"].append(issue)
+                rel_detail["status"] = "invalid"
+                continue
+            
+            # Get the data
+            parent_data = seed_tables_dict[parent_table]
+            child_data = seed_tables_dict[child_table]
+            
+            if not parent_data or not child_data:
+                issue = f"Empty data in {parent_table} or {child_table}"
+                rel_detail["issues"].append(issue)
+                integrity_report["violations"].append(issue)
+                rel_detail["status"] = "invalid"
+                continue
+            
+            # Extract primary keys from parent table
+            parent_keys = set()
+            for record in parent_data:
+                if parent_key in record:
+                    parent_keys.add(str(record[parent_key]))
+            
+            if not parent_keys:
+                issue = f"No values found for primary key '{parent_key}' in parent table '{parent_table}'"
+                rel_detail["issues"].append(issue)
+                integrity_report["violations"].append(issue)
+                rel_detail["status"] = "invalid"
+                continue
+            
+            # Extract foreign keys from child table and validate
+            child_foreign_keys = set()
+            invalid_references = []
+            
+            for record in child_data:
+                if child_key in record:
+                    fk_value = str(record[child_key])
+                    child_foreign_keys.add(fk_value)
+                    
+                    if fk_value not in parent_keys:
+                        invalid_references.append(fk_value)
+            
+            # Report validation results
+            if invalid_references:
+                issue = f"Invalid foreign key references in '{child_table}.{child_key}': {invalid_references[:5]}{'...' if len(invalid_references) > 5 else ''} (Total: {len(invalid_references)})"
+                rel_detail["issues"].append(issue)
+                integrity_report["violations"].append(issue)
+                rel_detail["status"] = "invalid"
+                integrity_report["is_valid"] = False
+            
+            rel_detail.update({
+                "parent_key_count": len(parent_keys),
+                "child_foreign_key_count": len(child_foreign_keys),
+                "invalid_references": len(invalid_references),
+                "sample_parent_keys": list(parent_keys)[:5],
+                "sample_child_keys": list(child_foreign_keys)[:5],
+                "sample_invalid_references": invalid_references[:5] if invalid_references else []
+            })
+            
+            integrity_report["relationship_details"].append(rel_detail)
+        
+        # Generate summary
+        total_violations = len(integrity_report["violations"])
+        valid_relationships = len([r for r in integrity_report["relationship_details"] if r["status"] == "valid"])
+        
+        integrity_report["summary"] = {
+            "total_relationships": len(relationships),
+            "valid_relationships": valid_relationships,
+            "invalid_relationships": len(relationships) - valid_relationships,
+            "total_violations": total_violations,
+            "overall_status": "PASS" if integrity_report["is_valid"] else "FAIL"
+        }
+        
+        if integrity_report["is_valid"]:
+            logger.info("✅ Referential integrity validation PASSED")
+        else:
+            logger.error(f"❌ Referential integrity validation FAILED with {total_violations} violations")
+            
+        return integrity_report
+        
+    except Exception as e:
+        logger.error(f"Error during referential integrity validation: {e}")
 
 def generate_sdv_data_optimized(num_records: int, metadata_dict: Dict[str, Any], seed_tables_dict: Dict[str, Any], 
                                batch_size: int = 1000, use_fast_synthesizer: bool = True) -> Dict[str, pd.DataFrame]:

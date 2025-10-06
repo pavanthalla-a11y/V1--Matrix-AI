@@ -1,63 +1,65 @@
+import requests
 import streamlit as st
 import pandas as pd
 import re
+import time
 from api import call_api, FASTAPI_URL, get_progress_info
 
 def show_step1():
-    st.header("STEP 1: DESIGN SCHEMA")
+    st.header("Design Schema")
     st.caption("Use natural language to describe your required tables and relationships.")
 
-    with st.container():
-        col_desc, col_num = st.columns([3, 1])
+    col_desc, col_num = st.columns([3, 1])
 
-        with col_desc:
-            st.session_state.data_description = st.text_area(
-                "Schema Description:",
-                st.session_state.data_description,
-                height=150,
-                key="main_data_description_input"
-            )
+    with col_desc:
+        st.session_state.data_description = st.text_area(
+            "Schema Description:",
+            st.session_state.data_description,
+            height=200,
+            key="main_data_description_input"
+        )
+    
+    with col_num:
+        st.number_input(
+            "Target Records:",
+            min_value=1,
+            max_value=1000000,
+            value=st.session_state.num_records,
+            step=100,
+            key="num_records_input"
+        )
         
-        with col_num:
-            st.session_state.num_records = st.number_input(
-                "Target Records:",
-                min_value=1,
-                max_value=1000000,
-                value=st.session_state.num_records,
-                step=100
-            )
+        estimated_time = max(1, st.session_state.num_records / 1000 * 0.5)
+        st.markdown(f"**Est. Time:** ~{estimated_time:.1f} min")
+        
+    if st.button("Generate Schema", use_container_width=True, type="primary"):
+        if st.session_state.data_description:
+            existing_metadata = None
+            if st.session_state.ai_design_output:
+                existing_metadata = st.session_state.ai_design_output.get("metadata_dict")
+                st.toast("Refinement requested: Sending context to Gemini.")
+                
+            payload = {
+                "data_description": st.session_state.data_description,
+                "num_records": st.session_state.num_records,
+                "existing_metadata": existing_metadata
+            }
             
-            estimated_time = max(1, st.session_state.num_records / 1000 * 0.5)
-            st.markdown(f"**Est. Time:** ~{estimated_time:.1f} min")
-            
-            if st.button("GENERATE SCHEMA", use_container_width=True, type="primary"):
-                if st.session_state.data_description:
-                    existing_metadata = None
-                    if st.session_state.ai_design_output:
-                        existing_metadata = st.session_state.ai_design_output.get("metadata_dict")
-                        st.toast("Refinement requested: Sending context to Gemini.")
-                        
-                    payload = {
-                        "data_description": st.session_state.data_description,
-                        "num_records": st.session_state.num_records,
-                        "existing_metadata": existing_metadata
-                    }
-                    
-                    with st.spinner("Calling Gemini to design schema and generate seed data..."):
-                        response = call_api("POST", f"{FASTAPI_URL}/design", payload)
+            with st.spinner("Calling Gemini to design schema and generate seed data..."):
+                response = call_api("POST", f"{FASTAPI_URL}/design", payload)
 
-                    if response and response.get("status") == "review_required":
-                        st.session_state.ai_design_output = {
-                            "metadata_dict": response.get("metadata_preview"),
-                            "seed_tables_dict": response.get("seed_data_preview"),
-                        }
-                        st.session_state.step = 2
-                        st.session_state.synthesis_status = "Not Started"
-                        st.success("SCHEMA DESIGN COMPLETE. Review the output below.")
-                        st.rerun()
+            if response and response.get("status") == "review_required":
+                st.session_state.ai_design_output = {
+                    "metadata_dict": response.get("metadata_preview"),
+                    "seed_tables_dict": response.get("seed_data_preview"),
+                }
+                st.session_state.step = 2
+                st.session_state.synthesis_status = "Not Started"
+                st.success("Schema design complete. Review the output below.")
+                st.rerun()
 
 def show_step2():
-    st.header("STEP 2: REVIEW SCHEMA")
+    st.header("Review Schema")
     st.caption("Confirm the AI-generated metadata and seed data before synthesis.")
     
     ai_output = st.session_state.ai_design_output
@@ -65,26 +67,22 @@ def show_step2():
     col_meta, col_seed = st.columns([1, 1])
 
     with col_meta:
-        with st.container():
-            st.subheader("METADATA STRUCTURE")
-            st.json(ai_output["metadata_dict"], expanded=False)
+        st.subheader("Metadata Structure")
+        st.json(ai_output["metadata_dict"], expanded=True)
 
     with col_seed:
-        with st.container():
-            st.subheader("SEED DATA SAMPLE")
-            st.markdown("This sample trains the SDV model.")
-            
-            table_names = list(ai_output["seed_tables_dict"].keys())
-            tabs = st.tabs(table_names)
-            
-            for i, table_name in enumerate(table_names):
-                with tabs[i]:
-                    df_seed = pd.DataFrame.from_records(ai_output["seed_tables_dict"][table_name])
-                    st.dataframe(df_seed, use_container_width=True)
+        st.subheader("Seed Data Sample")
+        
+        table_names = list(ai_output["seed_tables_dict"].keys())
+        tabs = st.tabs(table_names)
+        
+        for i, table_name in enumerate(table_names):
+            with tabs[i]:
+                df_seed = pd.DataFrame.from_records(ai_output["seed_tables_dict"][table_name])
+                st.dataframe(df_seed, use_container_width=True)
 
-    st.subheader("LAUNCH SYNTHESIS")
-    
-    col_email, col_settings, col_start_btn = st.columns([2, 1, 1])
+    st.subheader("Launch Synthesis")
+    col_email, col_start_btn = st.columns([3, 1])
 
     with col_email:
         st.session_state.email = st.text_input(
@@ -93,14 +91,8 @@ def show_step2():
             key="user_email_input_2"
         )
 
-    with col_settings:
-        st.markdown("**Performance Settings:**")
-        st.markdown(f"Batch Size: {st.session_state.batch_size:,}")
-        st.markdown(f"Fast Mode: {'Yes' if st.session_state.use_fast_synthesizer else 'No'}")
-
     with col_start_btn:
-        st.markdown("<br>", unsafe_allow_html=True) 
-        if st.button("APPROVE & START", use_container_width=True, type="primary"):
+        if st.button("Approve & Start", use_container_width=True, type="primary"):
             if not re.match(r"[^@]+@[^@]+\.[^@]+", st.session_state.email):
                 st.error("Please enter a valid email address.")
             else:
@@ -108,10 +100,10 @@ def show_step2():
                 st.rerun()
 
 def show_step3():
-    st.header("STEP 3: SYNTHESIS EXECUTION")
+    st.header("Synthesis Execution")
     
     if st.session_state.synthesis_status == "Not Started":
-        if st.button(f"BEGIN SYNTHESIS FOR {st.session_state.num_records:,} RECORDS", use_container_width=True, type="secondary"):
+        if st.button(f"Begin Synthesis for {st.session_state.num_records:,} Records", use_container_width=True, type="primary"):
             payload = {
                 "num_records": st.session_state.num_records,
                 "metadata_dict": st.session_state.ai_design_output["metadata_dict"],
@@ -126,37 +118,39 @@ def show_step3():
 
             if response and response.get("status") == "processing_started":
                 st.session_state.synthesis_status = "Processing"
-                st.success(f"OPTIMIZED SYNTHESIS STARTED! Notification will be sent to {st.session_state.email}")
-                st.info("The process is running in the background. Proceed to Step 4 to check status.")
-            
-            st.rerun()
+                st.success(f"Synthesis started! You will be notified at {st.session_state.email} when it's complete.")
+                st.info("The process is running in the background. You can monitor the progress in the sidebar or proceed to the next step to check the status when you receive the email.")
+                st.session_state.step = 4
+                st.rerun()
 
     elif st.session_state.synthesis_status == "Processing":
         st.warning(f"Synthesis is running in the background. You will receive an email at {st.session_state.email} when finished.")
-        
-        current_progress = get_progress_info()
-        if current_progress["status"] == "processing":
-            st.progress(current_progress["progress_percent"] / 100)
-            st.markdown(f"**Current Step:** {current_progress['current_step']}")
-            st.markdown(f"**Progress:** {current_progress['progress_percent']}%" )
-            if current_progress["records_generated"] > 0:
-                st.markdown(f"**Records Generated:** {current_progress['records_generated']:,}")
+        st.info("You can monitor the progress in the sidebar or wait for the email notification.")
+        if st.button("Go to Download Step"):
+            st.session_state.step = 4
+            st.rerun()
 
 def show_step4():
-    st.header("STEP 4: DATA FINALIZATION")
+    st.header("Data Finalization")
 
-    if st.button("CHECK IF DATA IS READY", use_container_width=True, type="secondary"):
-        ready_response = call_api("GET", f"{FASTAPI_URL}/sample", params={"sample_size": 20})
+    if st.session_state.synthesis_status != "Complete":
+        st.info("The data is not yet ready. You will receive an email when the synthesis is complete.")
         
-        if ready_response and ready_response.get("status") == "success":
-            st.session_state.synthesis_status = "Complete"
-            st.session_state.step = 4
-            st.success("DATA IS READY! Review samples and store the data.")
+        auto_refresh = st.checkbox("Auto-refresh status (every 10 seconds)")
+        if auto_refresh:
+            time.sleep(10)
             st.rerun()
-        elif st.session_state.synthesis_status == "Processing":
-            st.info("Data is still generating in the background. Please wait for the email notification.")
-        else:
-            st.error("Data is not yet ready or the background process failed. Check the server logs.")
+
+        if st.button("Check if Data is Ready", use_container_width=True, type="primary"):
+            ready_response = call_api("GET", f"{FASTAPI_URL}/sample", params={"sample_size": 20})
+            
+            if ready_response and ready_response.get("status") == "success":
+                st.session_state.synthesis_status = "Complete"
+                st.session_state.step = 4
+                st.success("Data is ready! You can now view the analysis and download the data.")
+                st.rerun()
+            else:
+                st.warning("Data is still processing. Please wait for the email notification or try again in a few moments.")
 
     if st.session_state.synthesis_status == "Complete":
         st.subheader("COMPREHENSIVE ANALYTICS & REPORTS")
@@ -603,7 +597,7 @@ def show_step4():
                         st.balloons()
                         st.success("✅ Download package ready! Click the button above to save your comprehensive data package with analytics.")
                         
-                    except requests.exceptions.RequestException as e:
+                    except requests.RequestException as e:
                         st.error(f"Download failed: {e}")
                         st.info("Ensure your FastAPI server is running and data synthesis is complete.")
                     except Exception as e:

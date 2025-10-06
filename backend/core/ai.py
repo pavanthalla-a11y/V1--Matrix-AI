@@ -104,8 +104,7 @@ def validate_and_fix_json_response(response_text: str) -> Dict[str, Any]:
             except json.JSONDecodeError as e2:
                 if attempt == 0:
                     # Attempt 1: Fix missing commas more aggressively
-                    fixed_text = re.sub(r'(\d+|"[^"]*"|\]|\})
-\s*("|\{|\[' )', r'\1,\n\2', fixed_text)
+                    fixed_text = re.sub(r'(\d+|"[^"]*"|\]|\})\s*("|\{|\[)', r'\1,\n\2', fixed_text)
                 elif attempt == 1:
                     # Attempt 2: Try to extract just the JSON object part
                     json_start = fixed_text.find('{')

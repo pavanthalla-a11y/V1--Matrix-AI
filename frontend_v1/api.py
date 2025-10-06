@@ -72,7 +72,7 @@ def call_api(method: str, url: str, payload: Dict[str, Any] = None, params: Dict
                 continue
             else:
                 st.error("🚨 CONNECTION ERROR: Cannot connect to FastAPI server")
-                st.info("💡 **Demo Fix**: Ensure FastAPI server is running: `python main.py`")
+                st.info("💡 **Demo Fix**: Ensure FastAPI server is running: `python main_v2.py`")
                 return None
                 
         except requests.exceptions.RequestException as e:

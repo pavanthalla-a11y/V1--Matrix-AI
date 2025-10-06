@@ -1,5 +1,5 @@
 import streamlit as st
-from ..api import get_progress_info
+from api import get_progress_info
 
 def show_sidebar():
     with st.sidebar:

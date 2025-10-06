@@ -7,8 +7,23 @@ from typing import Dict, Any
 import io
 import zipfile
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
+
+def convert_numpy_types(obj):
+    if isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy_types(i) for i in obj]
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    else:
+        return obj
 
 from .core.ai import call_ai_agent
 from .core.analytics import analyze_data_distribution, collect_synthesis_metrics
@@ -119,9 +134,13 @@ async def reports_endpoint():
     if not cache.get("synthesis_metrics") or not cache.get("distribution_analysis"):
         raise HTTPException(status_code=404, detail="Reports are not available yet.")
 
+    # Convert numpy types to native Python types for JSON serialization
+    synthesis_metrics = convert_numpy_types(cache["synthesis_metrics"])
+    distribution_analysis = convert_numpy_types(cache["distribution_analysis"])
+
     return {
-        "synthesis_metrics": cache["synthesis_metrics"],
-        "distribution_analysis": cache["distribution_analysis"],
+        "synthesis_metrics": synthesis_metrics,
+        "distribution_analysis": distribution_analysis,
     }
 
 
@@ -246,8 +265,8 @@ async def download_data_endpoint():
         reports = {
             "metadata.json": cache.get("design_output", {}).get("metadata_dict"),
             "seed_data.json": cache.get("design_output", {}).get("seed_tables_dict"),
-            "synthesis_metrics.json": cache.get("synthesis_metrics"),
-            "distribution_analysis.json": cache.get("distribution_analysis"),
+            "synthesis_metrics.json": convert_numpy_types(cache.get("synthesis_metrics")),
+            "distribution_analysis.json": convert_numpy_types(cache.get("distribution_analysis")),
         }
         for filename, content in reports.items():
             if content:
