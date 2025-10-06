@@ -365,6 +365,157 @@ def fix_seed_data_with_ai(data_description: str, seed_tables_dict: Dict[str, Any
         # Return original data if fixing fails
         return seed_tables_dict
 
+def enforce_precise_constraints_with_ai(data_description: str, synthetic_data: Dict[str, Any], metadata_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    NEW: Uses Gemini to enforce precise row-level conditional constraints on generated synthetic data.
+    This handles complex constraints like "exactly 100 out of 1000 users with no churn based on subscription_date".
+    """
+    try:
+        credentials, project = setup_google_auth()
+        vertexai.init(project=GCP_PROJECT_ID, location=GCP_LOCATION, credentials=credentials)
+
+        model = GenerativeModel(
+            GEMINI_MODEL,
+            generation_config={"response_mime_type": "application/json"}
+        )
+
+        # Convert DataFrames to dict for AI processing (sample first 50 rows for efficiency)
+        sampled_data = {}
+        for table_name, df in synthetic_data.items():
+            sampled_data[table_name] = df.head(50).to_dict('records')
+
+        constraint_prompt = f'''
+        You are a precise data constraint enforcer. Analyze the user's description and identify EXACT quantitative constraints.
+
+        **Original User Description:** "{data_description}"
+
+        **Sample of Generated Data (first 50 rows per table):**
+        {json.dumps(sampled_data, indent=2, default=str)}
+
+        **Your Task:**
+        1. Extract ALL precise quantitative constraints from the description:
+           - Exact counts: "exactly 100 users", "30% of subscriptions", "200 out of 1000"
+           - Conditional distributions: "users with premium_type='gold' should have 80% no churn"
+           - Row-level conditions: "if subscription_date < 2023-01-01 then churn_probability = 0.1"
+           - Precise percentages: "25% of orders should be status='cancelled'"
+
+        2. For each constraint, specify:
+           - Which table it applies to
+           - Which rows should match (based on conditions from other columns)
+           - What values should be set
+           - Exact count or percentage
+
+        **Return JSON format:**
+        {{
+            "constraints_found": [
+                {{
+                    "table": "table_name",
+                    "description": "exactly 100 users should have churn='no'",
+                    "condition": "subscription_type='premium'",
+                    "target_column": "churn",
+                    "target_value": "no",
+                    "exact_count": 100,
+                    "percentage": null
+                }},
+                {{
+                    "table": "orders",
+                    "description": "25% of orders cancelled",
+                    "condition": null,
+                    "target_column": "status",
+                    "target_value": "cancelled",
+                    "exact_count": null,
+                    "percentage": 25
+                }}
+            ]
+        }}
+
+        If no precise constraints found, return: {{"constraints_found": []}}
+        '''
+
+        logger.info("Extracting precise constraints with AI...")
+        response = model.generate_content(constraint_prompt)
+        constraint_info = validate_and_fix_json_response(response.text)
+
+        constraints_found = constraint_info.get("constraints_found", [])
+
+        if not constraints_found:
+            logger.info("No precise quantitative constraints detected")
+            return synthetic_data
+
+        logger.info(f"Found {len(constraints_found)} precise constraints to enforce")
+
+        # Apply each constraint to the full synthetic data
+        import pandas as pd
+        adjusted_data = {}
+
+        for table_name, df in synthetic_data.items():
+            adjusted_df = df.copy()
+
+            # Find constraints for this table
+            table_constraints = [c for c in constraints_found if c.get("table") == table_name]
+
+            for constraint in table_constraints:
+                try:
+                    target_col = constraint.get("target_column")
+                    target_val = constraint.get("target_value")
+                    condition = constraint.get("condition")
+                    exact_count = constraint.get("exact_count")
+                    percentage = constraint.get("percentage")
+
+                    if target_col not in adjusted_df.columns:
+                        logger.warning(f"Column {target_col} not found in {table_name}")
+                        continue
+
+                    # Determine how many rows to modify
+                    total_rows = len(adjusted_df)
+
+                    if condition:
+                        # Apply condition to filter eligible rows
+                        # Parse simple conditions like "subscription_type='premium'"
+                        import re
+                        match = re.match(r"(\w+)\s*[=!<>]+\s*['\"]?([^'\"]+)['\"]?", condition)
+                        if match:
+                            cond_col, cond_val = match.groups()
+                            if cond_col in adjusted_df.columns:
+                                eligible_mask = adjusted_df[cond_col].astype(str) == cond_val
+                                eligible_indices = adjusted_df[eligible_mask].index
+                            else:
+                                eligible_indices = adjusted_df.index
+                        else:
+                            eligible_indices = adjusted_df.index
+                    else:
+                        eligible_indices = adjusted_df.index
+
+                    # Calculate target count
+                    if exact_count:
+                        target_count = min(exact_count, len(eligible_indices))
+                    elif percentage:
+                        target_count = int(len(eligible_indices) * (percentage / 100))
+                    else:
+                        continue
+
+                    # Randomly select rows to modify
+                    if target_count > 0:
+                        import random
+                        selected_indices = random.sample(list(eligible_indices), min(target_count, len(eligible_indices)))
+                        adjusted_df.loc[selected_indices, target_col] = target_val
+
+                        logger.info(f"Applied constraint: Set {target_col}={target_val} for {len(selected_indices)} rows in {table_name}")
+
+                except Exception as constraint_error:
+                    logger.warning(f"Failed to apply constraint {constraint}: {constraint_error}")
+
+            adjusted_data[table_name] = adjusted_df
+
+        logger.info("✅ Precise constraint enforcement complete")
+        return adjusted_data
+
+    except Exception as e:
+        logger.error(f"Precise constraint enforcement failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return synthetic_data  # Return original data if enforcement fails
+
 def call_ai_agent(data_description: str, num_records: int, existing_metadata_json: str = None) -> Dict[str, Any]:
     """
     Calls the Gemini API to get the metadata schema and seed data.
@@ -382,10 +533,15 @@ def call_ai_agent(data_description: str, num_records: int, existing_metadata_jso
         raise HTTPException(status_code=500, detail=f"Failed to initialize Vertex AI: {e}")
 
     prompt = f'''
-    You are a professional data architect creating realistic datasets for AI/ML model training. 
+    You are a professional data architect creating realistic datasets for AI/ML model training.
     The final synthetic dataset will be scaled to **{num_records} records**. Your generated seed data must be a realistic, high-quality sample suitable for training a model to generate data at that scale.
 
-    **Core Request:** "{data_description}" 
+    **Core Request:** "{data_description}"
+
+    **IMPORTANT: Precise Constraint Awareness**
+    If the description contains EXACT quantitative constraints (like "exactly 100 users", "30% of records", "50 out of 1000"),
+    acknowledge them in your seed data proportionally. These precise constraints will be enforced post-generation, but your
+    seed data should reflect the approximate distribution to help the model learn the pattern. 
     
     {'**Refinement/Modification Instruction:** Based on the user\'s new description, modify the schema and seed data. Here is the existing metadata: ' + existing_metadata_json if existing_metadata_json else ''}
 

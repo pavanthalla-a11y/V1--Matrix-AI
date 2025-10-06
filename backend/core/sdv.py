@@ -956,6 +956,19 @@ def generate_sdv_data_optimized(num_records: int, metadata_dict: Dict[str, Any],
         else:
             logger.info("No datetime constraints - skipping")
 
+        # NEW: AI-driven precise constraint enforcement for row-level conditional logic
+        update_progress("processing", "Enforcing precise row-level constraints with AI", 88)
+
+        if data_description:
+            from .ai import enforce_precise_constraints_with_ai
+            logger.info("Running AI-based precise constraint enforcement...")
+            all_synthetic_data = enforce_precise_constraints_with_ai(
+                data_description,
+                all_synthetic_data,
+                metadata_dict
+            )
+            logger.info("✅ Precise constraint enforcement complete")
+
         update_progress("processing", "Finalizing data", 90)
         total_records = sum(len(df) for df in all_synthetic_data.values())
         logger.info(f"Successfully generated {total_records} total records")
