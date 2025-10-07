@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matrix-ai-cli"
+version = "1.0.0"
+authors = [
+  { name="Pavan Thalla", email="pavan.thalla@latentview.com" },
+]
+description = "A CLI tool for generating synthetic data using AI."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pandas",
+    "sdv",
+    "pydantic",
+    "google-cloud-aiplatform",
+    "google-auth",
+    "vertexai",
+    "requests",
+    "psutil",
+    "scipy",
+    "numpy",
+    "typer",
+    "rich",
+]
+
+[project.scripts]
+matrix-ai = "matrix_ai.cli:app"

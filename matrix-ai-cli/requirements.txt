@@ -1,0 +1,12 @@
+pandas
+sdv
+pydantic
+google-cloud-aiplatform
+google-auth
+vertexai
+requests
+psutil
+scipy
+numpy
+typer
+rich
